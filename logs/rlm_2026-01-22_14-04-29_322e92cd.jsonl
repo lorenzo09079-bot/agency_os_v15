@@ -1,1 +1,0 @@
-{"type": "metadata", "timestamp": "2026-01-22T14:04:29.437797", "root_model": "qwen-max", "max_depth": 3, "max_iterations": 50, "backend": "openai", "backend_kwargs": {"model_name": "qwen-max", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"}, "environment_type": "local", "environment_kwargs": {}, "other_backends": null}
