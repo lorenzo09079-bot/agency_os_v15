@@ -1,22 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-Tools v2.0 - Ricerca Memoria Aziendale
-Per Agency OS v5.0
+Tools v3.0 - Ricerca Memoria Aziendale
+Per Agency OS v9.0
 
-FIX: Usa il campo corretto 'client_name' invece di 'client'
+NOVITÀ:
+- Usa config.py centralizzato per gli IP
+- Basta modificare config.py quando cambiano gli IP!
 """
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
 
-# --- CONFIGURAZIONE ---
-IP_ZENBOOK = "http://192.168.1.4:6333"
-COLLECTION_NAME = "agenzia_memory"
+# ============================================
+# CONFIGURAZIONE CENTRALIZZATA
+# ============================================
+try:
+    from config import QDRANT_URL, COLLECTION_NAME
+    print(f"Tools v3: Config caricato (Qdrant: {QDRANT_URL})")
+except ImportError:
+    # Fallback se config.py non esiste
+    print("⚠️ config.py non trovato, uso valori di default")
+    QDRANT_URL = "http://192.168.1.6:6333"  # Asus IP attuale
+    COLLECTION_NAME = "agenzia_memory"
 
-print(f"Init Tools v2: Connessione a Zenbook ({IP_ZENBOOK})...")
+print(f"Tools v3: Connessione a {QDRANT_URL}...")
 encoder = SentenceTransformer('all-MiniLM-L6-v2')
-qdrant = QdrantClient(url=IP_ZENBOOK)
-print("Tools v2: Connesso!")
+qdrant = QdrantClient(url=QDRANT_URL)
+print("Tools v3: Connesso!")
 
 # --- MAPPING SHORTCUT ---
 TAG_SHORTCUTS = {
@@ -48,7 +58,7 @@ def normalize_filter(filter_input: str) -> str:
 
 def search_memory(query: str, client_filter: str = None) -> str:
     """
-    Esegue una ricerca semantica su Zenbook.
+    Esegue una ricerca semantica sul database vettoriale.
     
     Args:
         query: Testo da cercare
@@ -61,7 +71,7 @@ def search_memory(query: str, client_filter: str = None) -> str:
         # Normalizza filtro
         db_filter = normalize_filter(client_filter)
         
-        print(f"SEARCH: Query='{query}' | Filter='{client_filter}' -> '{db_filter}'")
+        print(f"SEARCH: Query='{query[:50]}...' | Filter='{client_filter}' -> '{db_filter}'")
         
         vector = encoder.encode(query).tolist()
         
@@ -71,7 +81,7 @@ def search_memory(query: str, client_filter: str = None) -> str:
             qdrant_filter = models.Filter(
                 must=[
                     models.FieldCondition(
-                        key="client_name",  # CORRETTO: era "client"
+                        key="client_name",
                         match=models.MatchValue(value=db_filter)
                     )
                 ]
@@ -101,7 +111,7 @@ def search_memory(query: str, client_filter: str = None) -> str:
         return context_str
 
     except Exception as e:
-        return f"SYSTEM ERROR: Errore connessione a Zenbook: {str(e)}"
+        return f"SYSTEM ERROR: Errore connessione database: {str(e)}"
 
 
 # Test se eseguito direttamente
