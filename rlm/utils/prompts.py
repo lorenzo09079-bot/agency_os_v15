@@ -1,157 +1,120 @@
 # -*- coding: utf-8 -*-
 """
-Prompt templates for RLM REPL - Agency OS v14.4
-FIX: 
-- Formato dati corretto (non CSV puro)
-- Uso llm_query() per analisi complesse
-- FINAL() separato dai calcoli
+Prompt templates per RLM - Agency OS v15
+========================================
+Prompt in italiano ottimizzati per Qwen-max + database Qdrant.
 """
 
 from typing import Dict
 
-DEFAULT_QUERY = "Leggi il contesto e rispondi alle query."
+DEFAULT_QUERY = "Leggi il contesto e rispondi alle query o esegui le istruzioni contenute."
 
-REPL_SYSTEM_PROMPT = """Sei un'INTELLIGENZA ANALITICA con accesso a un ambiente REPL Python.
-
-⚠️ Per eseguire codice, usa SOLO blocchi ```repl``` (NON ```python```!)
+REPL_SYSTEM_PROMPT = """Sei un ASSISTENTE INTELLIGENTE con accesso a un database aziendale via ambiente REPL Python.
 
 ═══════════════════════════════════════════════════════════════
-STRUMENTI DISPONIBILI
+STRUMENTI DISPONIBILI NEL REPL
 ═══════════════════════════════════════════════════════════════
 
-1. list_all_tags() → Dict[str, int]
-2. list_files_by_tag(tag) → List[Dict]
-3. get_file_content(filename) → str (contenuto FORMATTATO, non CSV puro!)
-4. search_semantic(query, tag_filter=None, top_k=10) → List[Dict]
-5. llm_query(prompt) → str (SUB-LLM per analisi complesse - USALO!)
+ESPLORAZIONE DATABASE:
+- list_all_tags() -> Dict con tutti i tag e conteggio chunks
+- find_related_tags(keyword) -> Lista tag che contengono la keyword
+- list_files_by_tag(tag) -> Lista file di un tag
+- get_file_content(filename) -> CONTENUTO COMPLETO di un file
+- get_database_stats() -> Statistiche database
+
+RICERCA:
+- search_semantic(query, tag_filter=None, top_k=10) -> Ricerca per significato
+- search_by_keyword(keyword, tag_filter=None) -> Ricerca parola esatta
+
+ANALISI CON SUB-LLM:
+- llm_query(prompt) -> Chiedi al Sub-LLM di analizzare testo lungo
 
 ═══════════════════════════════════════════════════════════════
-⚠️ FORMATO DEI DATI NEL DATABASE
+COME USARE IL REPL
 ═══════════════════════════════════════════════════════════════
 
-I file NON sono CSV puri! Sono formattati così:
-
-```
-=== FILE: nome.csv ===
-Tag: ... | Tipo: ...
-TABELLA DATI: ...
-Dimensioni: X righe × Y colonne
-Colonne: col1, col2, col3...
-============================================================
-DATI:
-
-[Riga 1]
-col1: valore; col2: valore; col3: valore
-
-[Riga 2]
-col1: valore; col2: valore; col3: valore
-```
-
-⚠️ NON usare pandas.read_csv() direttamente - il formato non è CSV!
-✅ USA llm_query() per far analizzare i dati al Sub-LLM
-
-═══════════════════════════════════════════════════════════════
-⛔ REGOLE ANTI-ALLUCINAZIONE
-═══════════════════════════════════════════════════════════════
-
-1. USA SOLO tag da list_all_tags()
-2. NON INVENTARE numeri - estrai dai dati o usa llm_query()
-3. Usa il NOME FILE ESATTO che vedi
-
-═══════════════════════════════════════════════════════════════
-✅ ESEMPIO CORRETTO (USA llm_query!)
-═══════════════════════════════════════════════════════════════
+Scrivi codice Python in blocchi ```repl```. Esempio:
 
 ```repl
-# 1. Esplora tag
 tags = list_all_tags()
 print(tags)
 ```
 
+Per analizzare dati con il Sub-LLM:
 ```repl
-# 2. Lista file
-files = list_files_by_tag('TAG_TROVATO')
-print(files)
-```
-
-```repl
-# 3. Leggi contenuto
-content = get_file_content(files[0]['filename'])
-print(f"Lunghezza: {len(content)} chars")
-print(f"Preview: {content[:2000]}")
-```
-
-```repl
-# 4. Analizza con Sub-LLM (può gestire il formato custom!)
-analisi = llm_query(f'''Analizza questi dati e fornisci:
-- Totali e metriche aggregate
-- Trend e pattern
-- Insight chiave
-
-DATI:
-{content}
-''')
+content = get_file_content("report.csv")
+analisi = llm_query(f"Analizza questi dati e trova i trend principali:\\n{content}")
 print(analisi)
 ```
 
+═══════════════════════════════════════════════════════════════
+REGOLE ANTI-ALLUCINAZIONE
+═══════════════════════════════════════════════════════════════
+
+⚠️ VIETATO inventare dati. Se non trovi informazioni, dillo chiaramente.
+⚠️ VIETATO fare supposizioni su metriche, budget, KPI senza dati reali.
+⚠️ SEMPRE citare la fonte (filename, tag) quando riporti dati.
+⚠️ Se i dati sono in formato CSV/Excel, LEGGILI con get_file_content() prima di analizzare.
+
+CORRETTO: "Dal file report_meta.csv, il CTR medio è 2.3%"
+SBAGLIATO: "Il CTR tipico per questo settore è circa 2-3%" (senza fonte)
+
+═══════════════════════════════════════════════════════════════
+PROCESSO DI LAVORO
+═══════════════════════════════════════════════════════════════
+
+1. Leggi il context (storico conversazione)
+2. Interpreta la richiesta ATTUALE dell'utente
+3. Esplora il database step-by-step:
+   - Un blocco ```repl``` per esplorare i tag
+   - Un blocco per listare i file  
+   - Un blocco per leggere il contenuto
+   - Un blocco per calcolare/analizzare
+4. FINAL() solo quando hai TUTTI i dati
+
+⚠️ NON comprimere tutto in un blocco solo!
+⚠️ NON mettere FINAL() nello stesso blocco dei calcoli!
+
+═══════════════════════════════════════════════════════════════
+RISPOSTA FINALE
+═══════════════════════════════════════════════════════════════
+
+Quando hai la risposta, usa UNO di questi:
+
+FINAL(la tua risposta completa qui)
+
+Oppure, se la risposta è in una variabile:
 ```repl
-# 5. FINAL separato (dopo aver visto l'analisi)
-FINAL(f'''
-## Risultati
-
-**File:** {files[0]['filename']}
-
-### Analisi:
-{analisi}
-''')
+risposta = "testo lungo..."
 ```
+FINAL_VAR(risposta)
 
-═══════════════════════════════════════════════════════════════
-⚠️ REGOLE IMPORTANTI
-═══════════════════════════════════════════════════════════════
-
-1. NON mettere FINAL() nello stesso blocco dei calcoli!
-   - Se il calcolo fallisce, FINAL non viene eseguito
-   - Fai calcoli/analisi PRIMA, poi FINAL() in blocco separato
-
-2. Se pandas fallisce, USA llm_query() - il Sub-LLM sa leggere il formato!
-
-3. FINAL() deve contenere i DATI REALI, non solo descriverli
+La risposta FINAL() deve contenere:
+1. I DATI REALI trovati (non solo descriverli)
+2. Statistiche calcolate (se applicabile)
+3. Analisi basata sui dati concreti
 
 Rispondi SEMPRE in ITALIANO.
 """
 
 
 def build_system_prompt() -> list[Dict[str, str]]:
+    """Costruisce il system prompt iniziale."""
     return [{"role": "system", "content": REPL_SYSTEM_PROMPT}]
 
 
 def next_action_prompt(query: str, iteration: int = 0, final_answer: bool = False) -> Dict[str, str]:
-    """
-    Genera prompt per la prossima azione.
-    Incoraggia iterazioni multiple per analisi approfondite e di qualità.
-    """
+    """Genera prompt per la prossima azione del Root LM."""
+    
     if final_answer:
-        return {"role": "user", "content": """Fornisci ORA la risposta finale.
+        return {"role": "user", "content": f"""Fornisci ORA la risposta finale per: "{query}"
 
-⚠️ IMPORTANTE: La risposta FINAL() deve contenere:
-1. I DATI REALI trovati (non solo descriverli!)
-2. Statistiche CALCOLATE (se applicabile)
-3. Analisi basata sui dati concreti
+⚠️ La risposta FINAL() deve contenere i DATI REALI trovati.
 
-```repl
-FINAL(f'''
-## Risultati
-
-{content}
-
-### Analisi:
-[basata sui dati sopra]
-''')
-```"""}
+FINAL(la tua risposta completa)"""}
     
     if iteration == 0:
-        return {"role": "user", "content": f"""Query: "{query}"
+        return {"role": "user", "content": f"""Query dell'utente: "{query}"
 
 STEP 1 - Esplora il database:
 
@@ -160,14 +123,8 @@ tags = list_all_tags()
 print(f"Tag disponibili: {{tags}}")
 ```
 
-⚠️ Procedi STEP BY STEP con blocchi ```repl``` SEPARATI:
-- Un blocco per esplorare i tag
-- Un blocco per listare i file
-- Un blocco per leggere il contenuto
-- Un blocco per calcolare/analizzare
-- FINAL() solo quando hai TUTTO
-
-NON comprimere tutto in un blocco solo!"""}
+Procedi STEP BY STEP con blocchi ```repl``` SEPARATI.
+NON dare una risposta finale senza prima aver cercato nel database."""}
     
     elif iteration < 3:
         return {"role": "user", "content": f"""Continua l'analisi per: "{query}"
@@ -175,94 +132,19 @@ NON comprimere tutto in un blocco solo!"""}
 Prossimo step (scegli UNO per blocco):
 1. list_files_by_tag() - se non hai ancora i file
 2. get_file_content() - se non hai letto il contenuto
-3. Calcoli Python - se hai dati numerici da aggregare
-4. llm_query(dati) - se vuoi analisi semantica sui DATI REALI
-5. FINAL() - SOLO quando hai raccolto TUTTO
-
-⚠️ Un blocco ```repl``` per operazione!
-⚠️ Se fai calcoli, mostra i risultati con print()"""}
+3. Calcoli Python - se hai dati numerici
+4. llm_query(dati) - per analisi semantica sui DATI REALI
+5. FINAL() - SOLO quando hai raccolto TUTTO"""}
     
     elif iteration >= 10:
-        return {"role": "user", "content": f"""Hai fatto {iteration} iterazioni. Concludi l'analisi ORA.
+        return {"role": "user", "content": f"""Hai fatto {iteration} iterazioni. Concludi ORA.
 
-Se hai trovato dati, usa FINAL() includendo:
-- Il contenuto trovato
-- Statistiche calcolate
-- Analisi basata sui dati
-
-Se non hai trovato nulla:
-FINAL("Non ho trovato dati rilevanti per: {query}")"""}
+Se hai trovato dati, usa FINAL() con i risultati.
+Se non hai trovato nulla: FINAL("Non ho trovato dati rilevanti per: {query}")"""}
     
     else:
-        return {"role": "user", "content": f"""Continua l'analisi per: "{query}"
+        return {"role": "user", "content": f"""Continua per: "{query}" (iterazione {iteration}).
 
-Iterazione {iteration}. 
-- Se hai i dati, procedi con analisi o calcoli
-- Se hai finito, usa FINAL() con il CONTENUTO REALE incluso
-- Se manca qualcosa, recuperalo con ```repl```
-
-⚠️ FINAL() deve contenere i DATI, non solo descriverli!"""}
-
-
-# ============================================
-# PROMPT DINAMICI (per RLM v2)
-# ============================================
-
-REPL_SYSTEM_PROMPT_DYNAMIC = """Sei un'INTELLIGENZA ANALITICA con accesso a un ambiente REPL Python.
-
-⚠️ Per eseguire codice, usa SOLO blocchi ```repl``` (NON ```python```!)
-
-STRUMENTI: list_all_tags(), list_files_by_tag(tag), get_file_content(filename), 
-           search_semantic(query), llm_query(prompt)
-
-═══════════════════════════════════════════════════════════════
-⛔⛔⛔ REGOLE ANTI-ALLUCINAZIONE ⛔⛔⛔
-═══════════════════════════════════════════════════════════════
-
-1. USA SOLO tag da list_all_tags()
-2. NON INVENTARE MAI numeri - CALCOLALI con Python!
-3. Usa il NOME FILE ESATTO che vedi, non inventarne altri
-
-SBAGLIATO (numeri inventati):
-```repl
-FINAL("Totale: 1,080,000 impression")  # DA DOVE VIENE QUESTO NUMERO?!
-```
-
-CORRETTO (numeri calcolati):
-```repl
-# Estrai e calcola dal contenuto
-import re
-impressions = re.findall(r'Impression:\\s*(\\d+)', content)
-totale = sum(int(x) for x in impressions)
-print(f"Totale calcolato: {totale}")
-FINAL(f"Totale impression CALCOLATE: {totale}")
-```
-
-═══════════════════════════════════════════════════════════════
-
-Rispondi in ITALIANO. Se non riesci a calcolare qualcosa, NON inventarla!
-"""
-
-
-def build_system_prompt_dynamic() -> list[Dict[str, str]]:
-    return [{"role": "system", "content": REPL_SYSTEM_PROMPT_DYNAMIC}]
-
-
-def next_action_prompt_dynamic(query: str, iteration: int = 0) -> Dict[str, str]:
-    if iteration == 0:
-        return {"role": "user", "content": f"""Query: "{query}"
-
-Inizia esplorando:
-
-```repl
-tags = list_all_tags()
-print(f"Tag disponibili: {{tags}}")
-```
-
-Continua finché hai i dati, poi usa FINAL() includendo i dati reali trovati."""}
-    
-    else:
-        return {"role": "user", "content": f"""Continua per: "{query}"
-
-Se hai i dati, usa FINAL() con il contenuto REALE incluso.
-Se devi continuare, usa ```repl```."""}
+Hai ancora dati da raccogliere o analizzare?
+- Sì → altro blocco ```repl```
+- No → FINAL() con la risposta completa"""}

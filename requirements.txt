@@ -1,0 +1,15 @@
+# Agency OS v15 - Dipendenze
+streamlit>=1.30.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+qdrant-client>=1.7.0
+sentence-transformers>=2.2.0
+
+# Ingester (estrazione testo)
+pymupdf>=1.23.0        # PDF
+python-docx>=1.0.0     # DOCX
+pandas>=2.0.0          # Excel/CSV
+openpyxl>=3.1.0        # Excel .xlsx
+
+# Logger (opzionale)
+rich>=13.0.0

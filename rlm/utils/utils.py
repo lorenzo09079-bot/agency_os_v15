@@ -1,62 +1,60 @@
 # -*- coding: utf-8 -*-
 """
-Utility functions for RLM REPL Client.
-v14.1 - Limiti aumentati per risposte dettagliate
+Utility functions per RLM - Agency OS v15
 """
 
 import re
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional
 
 
-def find_code_blocks(text: str) -> Optional[List[str]]:
-    """Trova blocchi ```repl``` nel testo."""
-    pattern = r'```repl\s*\n(.*?)\n```'
-    results = [match.group(1).strip() for match in re.finditer(pattern, text, re.DOTALL) if match.group(1).strip()]
-    return results if results else None
+def find_code_blocks(response: str) -> Optional[List[str]]:
+    """Estrae blocchi di codice ```repl``` dalla risposta."""
+    pattern = r'```repl\n(.*?)```'
+    matches = re.findall(pattern, response, re.DOTALL)
+    return matches if matches else None
 
 
-def find_final_answer(text: str) -> Optional[Tuple[str, str]]:
-    """Trova FINAL() o FINAL_VAR() nella risposta."""
-    # FINAL_VAR con nome variabile
-    for pattern in [r'FINAL_VAR\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)', 
-                    r'FINAL_VAR\s*\(\s*["\']([a-zA-Z_][a-zA-Z0-9_]*)["\']\s*\)']:
-        match = re.search(pattern, text)
-        if match:
-            return ('FINAL_VAR', match.group(1).strip())
+def find_final_answer(response: str) -> Optional[tuple]:
+    """Cerca FINAL() o FINAL_VAR() nella risposta."""
     
-    # FINAL con contenuto - pattern più permissivo per catturare tutto
-    match = re.search(r'FINAL\s*\(\s*(.+?)\s*\)(?:\s*$|\s*\n|\s*```)', text, re.DOTALL)
-    if match:
-        content = match.group(1).strip()
-        # Rimuovi quote esterne se presenti
-        if (content.startswith('"') and content.endswith('"')) or \
-           (content.startswith("'") and content.endswith("'")):
+    # FINAL_VAR(nome_variabile)
+    final_var_match = re.search(r'FINAL_VAR\(([^)]+)\)', response)
+    if final_var_match:
+        return ('FINAL_VAR', final_var_match.group(1))
+    
+    # FINAL(risposta) - gestisce contenuto multiriga
+    final_match = re.search(r'FINAL\((.*)\)', response, re.DOTALL)
+    if final_match:
+        content = final_match.group(1).strip()
+        # Rimuovi virgolette esterne se presenti
+        if (content.startswith("'") and content.endswith("'")) or \
+           (content.startswith('"') and content.endswith('"')):
             content = content[1:-1]
-        # Se sembra un nome variabile, trattalo come FINAL_VAR
-        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', content):
-            return ('FINAL_VAR', content)
+        # Gestisci f-string e triple quotes
+        if content.startswith("f'''") and content.endswith("'''"):
+            content = content[4:-3]
+        elif content.startswith("f'") and content.endswith("'"):
+            content = content[2:-1]
+        elif content.startswith('f"') and content.endswith('"'):
+            content = content[2:-1]
+        elif content.startswith("'''") and content.endswith("'''"):
+            content = content[3:-3]
+        elif content.startswith('"""') and content.endswith('"""'):
+            content = content[3:-3]
         return ('FINAL', content)
     
     return None
 
 
 def check_for_final_answer(response: str, repl_env, logger) -> Optional[str]:
-    """
-    Estrae la risposta finale.
+    """Controlla se la risposta contiene una risposta finale."""
     
-    PRIORITÀ:
-    1. Se FINAL() è stato eseguito nel REPL, usa quel risultato (variabili espanse!)
-    2. Altrimenti cerca FINAL() nel testo della risposta
-    """
-    # PRIMA: Controlla se FINAL() è stato eseguito nel REPL
-    if repl_env and hasattr(repl_env, 'get_final_result'):
-        final_from_repl = repl_env.get_final_result()
-        if final_from_repl:
-            logger.log_tool_execution("FINAL_FROM_REPL", f"Risultato REPL: {len(final_from_repl)} chars")
-            repl_env.clear_final_result()  # Reset per prossima iterazione
-            return final_from_repl
+    # Prima controlla se FINAL() è stato chiamato nel REPL
+    if hasattr(repl_env, 'get_final_result') and repl_env.get_final_result():
+        result = repl_env.get_final_result()
+        repl_env.clear_final_result()
+        return result
     
-    # FALLBACK: Cerca FINAL() nel testo della risposta (per casi senza esecuzione)
     result = find_final_answer(response)
     if result is None:
         return None
@@ -64,69 +62,51 @@ def check_for_final_answer(response: str, repl_env, logger) -> Optional[str]:
     answer_type, content = result
     
     if answer_type == 'FINAL':
-        final_content = content.strip()
-        
-        # Avvisa se sembra f-string non espansa
-        if '{' in final_content and '}' in final_content:
-            logger.log_tool_execution("FINAL_WARNING", 
-                "Possibile f-string non espansa - controlla che FINAL sia stato eseguito nel REPL")
-        
-        # Avvisa se troppo generico
-        generic_phrases = ["ho trovato un file", "il file contiene", "i dati mostrano"]
-        generic_count = sum(1 for p in generic_phrases if p in final_content.lower())
-        if generic_count >= 2 and len(final_content) < 500:
-            logger.log_tool_execution("FINAL_WARNING", 
-                f"Risposta potrebbe essere troppo generica ({generic_count} frasi vaghe)")
-        
-        return final_content
-    
+        return content
     elif answer_type == 'FINAL_VAR':
-        if repl_env is None or not hasattr(repl_env, 'locals'):
-            return "Errore: ambiente REPL non disponibile"
-        
-        variable_name = content.strip()
-        
-        # Cerca la variabile nel REPL
-        if variable_name in repl_env.locals:
-            value = repl_env.locals[variable_name]
-            if not callable(value):
-                return str(value)
-        
-        # Cerca alternative
-        available_vars = [k for k, v in repl_env.locals.items() 
-                        if not k.startswith('_') and not callable(v)]
-        
-        for keyword in ['final', 'answer', 'result', 'report', 'analysis', 'summary', 'risposta']:
-            for var in available_vars:
-                if keyword in var.lower():
-                    value = repl_env.locals[var]
-                    if isinstance(value, str) and len(value) > 50:
-                        logger.log_tool_execution("FINAL_VAR_FALLBACK", f"Usando '{var}'")
-                        return value
-        
-        # Ultima risorsa: stringa lunga
-        for var in available_vars:
-            value = repl_env.locals.get(var)
-            if isinstance(value, str) and len(value) > 200:
-                logger.log_tool_execution("FINAL_VAR_RESCUE", f"Usando '{var}' ({len(value)} chars)")
-                return value
-        
-        return f"Variabile '{variable_name}' non trovata. Disponibili: {available_vars}"
+        try:
+            variable_name = content.strip().strip('"').strip("'").strip()
+            
+            if variable_name in repl_env.locals:
+                return str(repl_env.locals[variable_name])
+            elif variable_name in repl_env.globals:
+                return str(repl_env.globals[variable_name])
+            else:
+                available_vars = [k for k in repl_env.locals.keys() if not k.startswith('_')]
+                error_msg = f"Variabile '{variable_name}' non trovata. Disponibili: {available_vars}"
+                logger.log_tool_execution("FINAL_VAR", error_msg)
+                return None
+        except Exception as e:
+            logger.log_tool_execution("FINAL_VAR", f"Errore: {str(e)}")
+            return None
     
     return None
 
 
+def convert_context_for_repl(context):
+    """Converte il context nel formato appropriato per il REPL."""
+    if isinstance(context, dict):
+        return context, None
+    elif isinstance(context, str):
+        return None, context
+    elif isinstance(context, list):
+        if len(context) > 0 and isinstance(context[0], dict):
+            if "content" in context[0]:
+                return [msg.get("content", "") for msg in context], None
+            else:
+                return context, None
+        else:
+            return context, None
+    else:
+        return context, None
+
+
 def add_execution_result_to_messages(messages, code, result, max_length=200000):
-    """
-    Aggiunge risultato esecuzione ai messaggi.
-    Limite aumentato a 200k caratteri per supportare risposte dettagliate.
-    """
+    """Aggiunge risultato esecuzione ai messaggi."""
     if len(result) > max_length:
         half = max_length // 2 - 100
-        result = result[:half] + "\n\n...[TRONCATO per limiti contesto - " + \
-                 f"{len(result) - max_length} caratteri omessi]...\n\n" + result[-half:]
+        result = result[:half] + f"\n\n...[TRONCATO - {len(result) - max_length} chars omessi]...\n\n" + result[-half:]
     
-    # Codice limitato a 15k (dovrebbe bastare)
     code_display = code[:15000] if len(code) > 15000 else code
     
     messages.append({
@@ -137,20 +117,16 @@ def add_execution_result_to_messages(messages, code, result, max_length=200000):
 
 
 def format_execution_result(stdout, stderr, locals_dict, truncate_var_preview=500):
-    """
-    Formatta risultato esecuzione.
-    stdout NON viene troncato - il modello deve vedere tutto per dare risposte complete.
-    """
+    """Formatta risultato esecuzione. stdout NON troncato."""
     parts = []
     
     if stdout:
-        # NON troncare stdout - serve completo per analisi dettagliate
         parts.append(stdout)
     
     if stderr:
         parts.append(f"STDERR: {stderr}")
     
-    # Mostra variabili disponibili (ma non il contenuto completo)
+    # Mostra variabili disponibili
     vars_info = []
     for k, v in locals_dict.items():
         if not k.startswith('_') and not callable(v):
@@ -177,7 +153,6 @@ def execute_code(repl_env, code, repl_env_logger, logger):
         repl_env_logger.log_execution(code, result.stdout, result.stderr, result.execution_time)
         repl_env_logger.display_last()
         
-        # Log breve per console (ma il risultato completo va ai messaggi)
         log_preview = formatted[:800] + "..." if len(formatted) > 800 else formatted
         logger.log_tool_execution("CODE", log_preview)
         
@@ -191,42 +166,30 @@ def execute_code(repl_env, code, repl_env_logger, logger):
 def process_code_execution(response, messages, repl_env, repl_env_logger, logger):
     """Processa tutti i blocchi di codice nella risposta."""
     code_blocks = find_code_blocks(response)
+    
     if code_blocks:
         for code in code_blocks:
-            result = execute_code(repl_env, code, repl_env_logger, logger)
-            messages = add_execution_result_to_messages(messages, code, result)
+            execution_result = execute_code(repl_env, code, repl_env_logger, logger)
+            messages = add_execution_result_to_messages(messages, code, execution_result)
+    
     return messages
 
 
-def convert_context_for_repl(context):
-    """Converte il contesto nel formato appropriato per REPL."""
-    if isinstance(context, dict):
-        return context, None
-    elif isinstance(context, str):
-        return None, context
-    elif isinstance(context, list):
-        if context and isinstance(context[0], dict) and "content" in context[0]:
-            return [msg.get("content", "") for msg in context], None
-        return context, None
-    return context, None
-
-
-def truncate_messages_if_needed(messages, max_tokens=50000):
-    """
-    Tronca history se supera limite token.
-    Limite aumentato a 50k token per supportare conversazioni più lunghe.
-    """
-    total = sum(len(m.get("content", "")) for m in messages) // 4
-    if total <= max_tokens or len(messages) <= 7:
+def truncate_messages_if_needed(messages, max_tokens=80000):
+    """Tronca i messaggi più vecchi mantenendo system prompt e ultimi messaggi."""
+    total_text = "".join(m.get("content", "") for m in messages)
+    estimated_tokens = len(total_text) // 4
+    
+    if estimated_tokens <= max_tokens:
         return messages
     
-    system = messages[0] if messages[0].get("role") == "system" else None
-    recent = messages[-8:]  # Mantieni più messaggi recenti
-    notice = {"role": "user", "content": "[...messaggi precedenti omessi per limiti contesto...]"}
+    # Mantieni: system prompt (primo) + ultimi N messaggi
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    other_msgs = [m for m in messages if m.get("role") != "system"]
     
-    return ([system] if system else []) + [notice] + recent
-
-
-def estimate_tokens(text: str) -> int:
-    """Stima approssimativa dei token."""
-    return len(text) // 4
+    # Rimuovi dal centro, tieni primi 2 e ultimi 6
+    if len(other_msgs) > 8:
+        kept = other_msgs[:2] + other_msgs[-6:]
+        return system_msgs + kept
+    
+    return messages
