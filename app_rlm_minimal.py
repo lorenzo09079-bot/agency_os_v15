@@ -1,279 +1,390 @@
 # -*- coding: utf-8 -*-
 """
-Agency OS v9.0 - TRUE RLM MINIMAL Integration
-============================================
+Agency OS v14.0 - QWEN/DASHSCOPE
+================================
 
-Integrazione VERA di RLM Minimal con il tuo sistema Agency OS.
+Changelog da v13:
+- MIGRATO: Da RouteWay.ai a DashScope International (Singapore)
+- ROOT LM: qwen3-coder-plus (specializzato codice Python REPL)
+- SUB LM: qwen-plus (analisi testi, ragionamento)
+- API: OpenAI-compatible via DashScope
+- COSTO: ~$3/mese per uso moderato (+ 1M token free per 90gg)
 
-NOVITÀ v9.0:
-- Usa config.py centralizzato per gli IP (modifica lì quando cambiano!)
-- RLM Minimal per ragionamento ricorsivo
-- Qwen-max come LLM principale
+FILOSOFIA (invariata):
+- Lo storico COMPLETO viene passato all'AI
+- L'AI DECIDE cosa è rilevante in base alla richiesta attuale
+- Non limitiamo artificialmente - lasciamo che l'intelligenza capisca
 """
 
 import streamlit as st
 import sys
 import os
-import json
-import datetime
+import time
+import requests
 from pathlib import Path
-from openai import OpenAI
 
-# ============================================
-# CONFIGURAZIONE CENTRALIZZATA
-# ============================================
-try:
-    from config import (
-        ASUS_IP, ACER_IP, QDRANT_URL, QDRANT_HOST, QDRANT_PORT,
-        INGEST_URL, INGEST_ENDPOINT, COLLECTION_NAME,
-        QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL_DEFAULT
-    )
-    print("✅ Config caricato da config.py")
-except ImportError:
-    # Fallback se config.py non esiste
-    print("⚠️ config.py non trovato, uso valori di default")
-    ASUS_IP = "192.168.1.6"
-    ACER_IP = "192.168.1.8"
-    QDRANT_URL = f"http://{ASUS_IP}:6333"
-    QDRANT_HOST = ASUS_IP
-    QDRANT_PORT = 6333
-    INGEST_ENDPOINT = f"http://{ACER_IP}:5000/ingest"
-    COLLECTION_NAME = "agenzia_memory"
-    QWEN_API_KEY = "sk-96a9773427c649d5a6af2a6842404c88"
-    QWEN_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-    QWEN_MODEL_DEFAULT = "qwen-max"
+# Path setup
+project_path = Path(__file__).parent
+if str(project_path) not in sys.path:
+    sys.path.insert(0, str(project_path))
 
-# Import moduli locali esistenti
+# Import locali
 import tools
 import personas
-
-# --- CHECK RLM MINIMAL ---
-RLM_AVAILABLE = False
-RLM_ERROR = None
-
-try:
-    from rlm.rlm_repl import RLM_REPL
-    RLM_AVAILABLE = True
-    print("✅ RLM Minimal caricato correttamente")
-except ImportError as e:
-    RLM_ERROR = str(e)
-    print(f"❌ RLM Minimal non disponibile: {e}")
-
-# --- CONFIGURAZIONE STREAMLIT ---
-st.set_page_config(
-    page_title="Agency OS v9.0 - RLM Minimal",
-    layout="wide",
-    page_icon="🧠"
+from config import (
+    QWEN_API_KEY, QWEN_BASE_URL, 
+    QWEN_MODEL_ROOT, QWEN_MODEL_SUB,
+    ACER_IP, ACER_PORT, API_KEY, BASE_URL
 )
 
-# Client AI standard (per fallback)
-client_ai = OpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
+# Import RLM
+from rlm.rlm_repl import RLM_REPL
+from rlm.utils.prompts import DEFAULT_QUERY, next_action_prompt, build_system_prompt
+import rlm.utils.utils as utils
+
+# --- CONFIG ---
+st.set_page_config(page_title="Agency OS v14.0", layout="wide", page_icon="🧠")
+
+INGEST_URL = f"http://{ACER_IP}:{ACER_PORT}/ingest"
+
+# Modelli disponibili (DashScope)
+AVAILABLE_MODELS = {
+    "Root LM (Codice)": [
+        ("qwen3-coder-plus", "Qwen3 Coder Plus - Best per codice"),
+        ("qwen-plus", "Qwen Plus - Generale bilanciato"),
+        ("qwen-flash", "Qwen Flash - Veloce ed economico"),
+        ("qwen-max", "Qwen Max - Più potente ma costoso")
+    ],
+    "Sub LM (Testi)": [
+        ("qwen-plus", "Qwen Plus - Best per analisi"),
+        ("qwen-flash", "Qwen Flash - Veloce ed economico"),
+        ("qwen3-coder-plus", "Qwen3 Coder Plus - Se serve codice"),
+    ]
+}
 
 
-# --- FUNZIONI HELPER PER RLM ---
+# ============================================
+# TOOLS
+# ============================================
 
-def build_context_for_rlm(query: str, active_client: str = None) -> str:
+def get_tools_for_injection() -> dict:
+    return {
+        'list_all_tags': tools.list_all_tags,
+        'find_related_tags': tools.find_related_tags,
+        'list_files_by_tag': tools.list_files_by_tag,
+        'get_file_content': tools.get_file_content,
+        'get_database_stats': tools.get_database_stats,
+        'search_semantic': tools.search_semantic,
+        'search_by_keyword': tools.search_by_keyword,
+        'search_memory': tools.search_memory,
+    }
+
+
+# ============================================
+# CONTEXT BUILDER - STORICO COMPLETO
+# ============================================
+
+def build_full_context(chat_history: list, active_client: str = None) -> str:
     """
-    Costruisce il contesto da passare a RLM.
-    Include i risultati delle ricerche nel vector DB.
+    Costruisce il contesto con TUTTO lo storico.
+    L'AI decide cosa è rilevante.
     """
-    context_parts = []
+    parts = []
     
-    # 1. Informazioni sul cliente attivo
+    # Cliente attivo (se specificato)
     if active_client:
-        context_parts.append(f"=== CLIENTE ATTIVO: {active_client.upper()} ===")
-        context_parts.append(f"Priorità ricerca: CLIENT_{active_client.upper()}, CHAT_{active_client.upper()}")
-        context_parts.append("")
+        parts.append(f"=== FOCUS CLIENTE: {active_client.upper()} ===")
+        parts.append(f"Tag probabili: DATI_{active_client.upper()}_*, CLIENTE_{active_client.upper()}")
+        parts.append("")
     
-    # 2. Ricerca principale
-    context_parts.append("=== RISULTATI RICERCA PRINCIPALE ===")
-    
-    # Prima cerca con filtro cliente se specificato
-    if active_client:
-        client_results = tools.search_memory(query, f"CLIENT_{active_client.upper()}")
-        if "Nessun dato trovato" not in client_results:
-            context_parts.append(f"[Dati cliente {active_client}]")
-            context_parts.append(client_results)
+    # STORICO COMPLETO (l'AI capisce cosa serve)
+    if chat_history and len(chat_history) > 1:
+        parts.append("=== STORICO CONVERSAZIONE COMPLETO ===")
+        parts.append("(Usa questo per capire il contesto, ma rispondi alla richiesta ATTUALE)")
+        parts.append("")
         
-        # Cerca anche nelle chat
-        chat_results = tools.search_memory(query, f"CHAT_{active_client.upper()}")
-        if "Nessun dato trovato" not in chat_results:
-            context_parts.append(f"[Chat {active_client}]")
-            context_parts.append(chat_results)
+        for i, msg in enumerate(chat_history[:-1], 1):
+            role = "UTENTE" if msg["role"] == "user" else "ASSISTENTE"
+            content = msg["content"]
+            
+            if len(content) > 1000:
+                content = content[:1000] + "... [troncato]"
+            
+            parts.append(f"[{i}. {role}]:")
+            parts.append(content)
+            parts.append("")
+        
+        parts.append("=== FINE STORICO ===")
+        parts.append("")
+        parts.append("IMPORTANTE: Rispondi alla richiesta ATTUALE dell'utente.")
+    else:
+        parts.append("Nessun messaggio precedente.")
     
-    # Ricerca globale
-    global_results = tools.search_memory(query, None)
-    context_parts.append("[Ricerca globale]")
-    context_parts.append(global_results)
-    
-    # 3. Aggiungi istruzioni per RLM
-    context_parts.append("")
-    context_parts.append("=== ISTRUZIONI ===")
-    context_parts.append("Usa il contesto sopra per rispondere alla query dell'utente.")
-    context_parts.append("Se i dati non sono sufficienti, indica cosa manca.")
-    context_parts.append("Cita sempre le fonti (nome file) quando usi informazioni dal contesto.")
-    
-    return "\n".join(context_parts)
+    return "\n".join(parts)
 
 
-def get_system_prompt_for_rlm(persona: str, active_client: str = None) -> str:
+# ============================================
+# RLM EXECUTION
+# ============================================
+
+def run_rlm(
+    query: str,
+    chat_history: list,
+    active_client: str = None,
+    model: str = None,
+    recursive_model: str = None,
+    max_iterations: int = 15,
+    show_logs: bool = False
+) -> dict:
     """
-    Costruisce un system prompt ottimizzato per RLM.
+    Esegue RLM con Qwen via DashScope.
+    Root: qwen3-coder-plus (codice)
+    Sub: qwen-plus (testi)
     """
-    client_note = ""
-    if active_client:
-        client_note = f"\nCLIENTE FOCUS: {active_client.upper()} - dai priorità ai suoi dati ma confronta con altri."
+    start_time = time.time()
     
-    return f"""{persona}
-
-=== AGENCY OS - SISTEMA RLM ===
-
-Sei un AI strategist per un'agenzia di marketing. Hai accesso a:
-- Database vettoriale con ricerche, documenti, chat passate
-- Capacità di ragionamento ricorsivo tramite REPL
-{client_note}
-
-COME USARE IL REPL:
-1. Esamina sempre `context` per vedere i dati disponibili
-2. Usa `llm_query(prompt)` per analisi complesse su porzioni di contesto
-3. Quando hai la risposta, usa FINAL(risposta) o FINAL_VAR(variabile)
-
-IMPORTANTE:
-- Cita sempre le fonti quando usi dati dal contesto
-- Se mancano informazioni, dillo chiaramente
-- Per domande complesse, decomponi in sub-analisi con llm_query()
-"""
-
-
-# --- SIDEBAR ---
-with st.sidebar:
-    st.title("🧠 Agency OS v9.0")
+    # Default ai modelli config
+    model = model or QWEN_MODEL_ROOT
+    recursive_model = recursive_model or QWEN_MODEL_SUB
     
-    # Status RLM
-    if RLM_AVAILABLE:
-        st.success("RLM Minimal: ✅ Attivo")
-    else:
-        st.error(f"RLM Minimal: ❌ {RLM_ERROR}")
-        st.info("Usa modalità Standard come fallback")
-    
-    # Status connessioni
-    with st.expander("🔌 Stato Connessioni"):
-        st.text(f"Qdrant (Asus): {ASUS_IP}")
-        st.text(f"Ingest (Acer): {ACER_IP}")
-        st.caption("Modifica config.py per cambiare IP")
-    
-    st.divider()
-    
-    # Modalità
-    st.subheader("⚡ Modalità")
-    
-    if RLM_AVAILABLE:
-        execution_mode = st.radio(
-            "Motore AI",
-            ["🚀 RLM Minimal (Ricorsivo)", "⚡ Standard (Veloce)"],
-            help=(
-                "RLM: Ragionamento ricorsivo multi-step\n"
-                "Standard: Risposta single-pass"
-            )
-        )
-        use_rlm = "RLM" in execution_mode
-    else:
-        st.warning("RLM non disponibile")
-        use_rlm = False
-    
-    # Config RLM
-    if use_rlm:
-        with st.expander("🔧 Config RLM"):
-            max_iterations = st.slider(
-                "Max Iterazioni", 5, 20, 10,
-                help="Numero massimo di cicli REPL"
-            )
-            show_logs = st.checkbox("Mostra Log", value=True)
-            recursive_model = st.selectbox(
-                "Modello Sub-LLM",
-                ["qwen-plus", "qwen-turbo", "qwen-max"],
-                help="Modello per le chiamate ricorsive (più economico = più veloce)"
-            )
-    else:
-        max_iterations = 10
-        show_logs = False
-        recursive_model = "qwen-plus"
-    
-    st.divider()
-    
-    # Cliente focus
-    st.subheader("🎯 Cliente Focus")
-    active_client = st.text_input(
-        "Cliente principale",
-        help="L'AI darà priorità ai dati di questo cliente"
-    )
-    if active_client:
-        st.info(f"Focus: {active_client.upper()}")
-    
-    st.divider()
-    
-    # Specialista
-    st.subheader("🎭 Specialista")
     try:
-        available_roles = list(personas.PERSONA_MAP.keys())
+        # Setta env vars per OpenAI client
+        os.environ["OPENAI_API_KEY"] = QWEN_API_KEY
+        os.environ["OPENAI_BASE_URL"] = QWEN_BASE_URL
+        
+        # 1. Crea RLM
+        rlm = RLM_REPL(
+            model=model,
+            recursive_model=recursive_model,
+            max_iterations=max_iterations,
+            enable_logging=show_logs
+        )
+        
+        # 2. Costruisci contesto COMPLETO
+        context = build_full_context(chat_history, active_client)
+        
+        # 3. Setup
+        rlm.setup_context(context=context, query=query)
+        
+        # 4. Inietta tools nel REPL
+        if hasattr(rlm, 'repl_env') and rlm.repl_env:
+            rlm.repl_env.inject_tools(get_tools_for_injection())
+        
+        if show_logs:
+            print(f"[DEBUG] Root: {model}, Sub: {recursive_model}")
+            print(f"[DEBUG] Tools: {list(get_tools_for_injection().keys())}")
+        
+        # 5. Loop RLM
+        for iteration in range(max_iterations):
+            try:
+                response = rlm.llm.completion(
+                    rlm.messages + [next_action_prompt(query, iteration)]
+                )
+            except Exception as e:
+                if "length" in str(e).lower() or "token" in str(e).lower():
+                    rlm.messages = utils.truncate_messages_if_needed(rlm.messages, 15000)
+                    response = rlm.llm.completion(
+                        rlm.messages + [next_action_prompt(query, iteration)]
+                    )
+                else:
+                    raise
+            
+            code_blocks = utils.find_code_blocks(response)
+            rlm.logger.log_model_response(response, has_tool_calls=code_blocks is not None)
+            
+            if code_blocks:
+                rlm.messages = utils.process_code_execution(
+                    response, rlm.messages, rlm.repl_env,
+                    rlm.repl_env_logger, rlm.logger
+                )
+            else:
+                if len(response) > 5000:
+                    response = response[:5000] + "..."
+                rlm.messages.append({"role": "assistant", "content": response})
+            
+            final_answer = utils.check_for_final_answer(response, rlm.repl_env, rlm.logger)
+            
+            if final_answer:
+                rlm.logger.log_final_response(final_answer)
+                
+                # Calcola costo stimato
+                stats = rlm.llm.get_usage_stats() if hasattr(rlm.llm, 'get_usage_stats') else {}
+                
+                return {
+                    "success": True,
+                    "response": final_answer,
+                    "time": time.time() - start_time,
+                    "iterations": iteration + 1,
+                    "model": model,
+                    "cost": stats.get("cost_usd", 0)
+                }
+        
+        # Max iterations
+        rlm.messages.append(next_action_prompt(query, max_iterations, final_answer=True))
+        final_response = rlm.llm.completion(rlm.messages)
+        
+        stats = rlm.llm.get_usage_stats() if hasattr(rlm.llm, 'get_usage_stats') else {}
+        
+        return {
+            "success": True,
+            "response": final_response,
+            "time": time.time() - start_time,
+            "iterations": max_iterations,
+            "model": model,
+            "cost": stats.get("cost_usd", 0)
+        }
+        
+    except Exception as e:
+        import traceback
+        return {
+            "success": False,
+            "response": f"Errore: {str(e)}",
+            "time": time.time() - start_time,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+
+# ============================================
+# UI HELPERS
+# ============================================
+
+def get_available_clients() -> list:
+    try:
+        tags = tools.list_all_tags()
+        clients = set()
+        for tag in tags.keys():
+            for prefix in ['CLIENT_', 'CLIENTE_', 'DATA_', 'DATI_', 'CHAT_']:
+                if tag.startswith(prefix):
+                    clients.add(tag[len(prefix):].split('_')[0])
+                    break
+        return sorted(clients)
     except:
-        available_roles = ["General Analyst"]
-    selected_mode = st.selectbox("Ruolo", available_roles)
+        return []
+
+
+def test_api_connection() -> tuple[bool, str]:
+    """Testa connessione API Qwen."""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
+        response = client.chat.completions.create(
+            model="qwen-flash",  # Più economico per test
+            messages=[{"role": "user", "content": "OK"}],
+            max_tokens=5
+        )
+        return True, "OK"
+    except Exception as e:
+        return False, str(e)[:50]
+
+
+# ============================================
+# SIDEBAR
+# ============================================
+
+with st.sidebar:
+    st.title("🧠 Agency OS v14.0")
+    st.caption("Qwen + DashScope")
     
     st.divider()
     
-    # Upload documenti
-    st.subheader("📂 Carica Documenti")
-    uploaded_files = st.file_uploader(
-        "File",
-        type=["pdf", "txt", "docx", "xlsx", "csv", "md"],
-        accept_multiple_files=True
+    # Status
+    col1, col2 = st.columns(2)
+    col1.success("RLM ✅")
+    
+    try:
+        stats = tools.get_database_stats()
+        col2.success("DB ✅")
+        st.metric("Documenti", stats.get("total_files", 0))
+        st.metric("Tag", stats.get("total_tags", 0))
+    except:
+        col2.error("DB ❌")
+    
+    st.divider()
+    
+    # Modelli
+    st.subheader("⚙️ Modelli")
+    
+    root_options = AVAILABLE_MODELS["Root LM (Codice)"]
+    root_model = st.selectbox(
+        "Root LM (Codice)",
+        options=[m[0] for m in root_options],
+        format_func=lambda x: next((m[1] for m in root_options if m[0] == x), x),
+        index=0
     )
     
-    client_tag = st.text_input("Tag", value=f"CLIENT_{active_client.upper()}" if active_client else "GENERALE")
-    doc_type = st.selectbox("Tipo", ["Strategia", "Ricerca", "Report", "Chat", "Meeting"])
+    sub_options = AVAILABLE_MODELS["Sub LM (Testi)"]
+    recursive_model = st.selectbox(
+        "Sub LM (Testi)",
+        options=[m[0] for m in sub_options],
+        format_func=lambda x: next((m[1] for m in sub_options if m[0] == x), x),
+        index=0
+    )
     
-    if st.button("📤 Carica", use_container_width=True):
-        if uploaded_files:
-            import requests
-            progress = st.progress(0)
-            for i, f in enumerate(uploaded_files):
-                try:
-                    f.seek(0)
-                    files = {"file": (f.name, f, f.type)}
-                    data = {"client_name": client_tag, "doc_type": doc_type}
-                    requests.post(INGEST_ENDPOINT, files=files, data=data, timeout=120)
-                except Exception as e:
-                    st.error(f"{f.name}: {e}")
-                progress.progress((i + 1) / len(uploaded_files))
-            st.success(f"Caricati {len(uploaded_files)} file")
+    max_iter = st.slider("Max Iterazioni", 5, 20, 10)
+    show_logs = st.checkbox("🔍 Mostra Log", value=False)
     
     st.divider()
     
-    # Stats
-    with st.expander("📊 Statistiche"):
-        if "total_cost" not in st.session_state:
-            st.session_state.total_cost = 0.0
-        if "total_queries" not in st.session_state:
-            st.session_state.total_queries = 0
-        
-        col1, col2 = st.columns(2)
-        col1.metric("Query", st.session_state.total_queries)
-        col2.metric("Costo", f"${st.session_state.total_cost:.3f}")
-        
-        if st.button("Reset", use_container_width=True):
-            st.session_state.total_cost = 0.0
-            st.session_state.total_queries = 0
-            st.session_state.history = []
-            st.rerun()
+    # Focus cliente
+    st.subheader("🎯 Focus")
+    clients = get_available_clients()
+    opts = ["(Tutti i clienti)"] + clients
+    sel = st.selectbox("Cliente", range(len(opts)), format_func=lambda i: opts[i])
+    active_client = None if sel == 0 else opts[sel]
+    
+    st.divider()
+    
+    # Upload
+    st.subheader("📤 Upload")
+    files = st.file_uploader(
+        "File", 
+        type=["pdf", "txt", "docx", "xlsx", "csv", "md"], 
+        accept_multiple_files=True, 
+        label_visibility="collapsed"
+    )
+    tag = st.text_input("Tag", value=f"DATI_{active_client.upper()}" if active_client else "GENERALE")
+    dtype = st.selectbox("Tipo", ["Report Dati", "Strategia", "Ricerca", "Chat", "Meeting"])
+    
+    if st.button("📤 Carica", use_container_width=True) and files:
+        for f in files:
+            try:
+                f.seek(0)
+                res = requests.post(
+                    INGEST_URL, 
+                    files={"file": (f.name, f)}, 
+                    data={"client_name": tag, "doc_type": dtype}, 
+                    timeout=120
+                )
+                if res.status_code == 200:
+                    st.success(f"✅ {f.name}")
+                else:
+                    st.error(f"❌ {f.name}")
+            except Exception as e:
+                st.error(f"❌ {f.name}: {e}")
+    
+    st.divider()
+    
+    # Session stats
+    if "total_cost" not in st.session_state:
+        st.session_state.total_cost = 0.0
+    
+    col1, col2 = st.columns(2)
+    col1.metric("Queries", len([m for m in st.session_state.get("history", []) if m["role"] == "user"]))
+    col2.metric("Costo", f"${st.session_state.total_cost:.4f}")
+    
+    if st.button("🗑️ Reset Chat", use_container_width=True):
+        st.session_state.history = []
+        st.session_state.total_cost = 0.0
+        st.rerun()
 
 
-# --- MAIN ---
-mode_label = "🚀 RLM" if use_rlm else "⚡ STD"
-st.title(f"{mode_label} Agency OS • {selected_mode}")
+# ============================================
+# MAIN AREA
+# ============================================
 
-if active_client:
-    st.caption(f"Cliente focus: {active_client} | Ragionamento {'ricorsivo' if use_rlm else 'standard'}")
+st.title("🧠 Agency OS v14.0")
+st.caption(f"Focus: **{active_client or 'Tutti'}** | Root: {root_model} | Sub: {recursive_model}")
 
 # History
 if "history" not in st.session_state:
@@ -284,143 +395,56 @@ for msg in st.session_state.history:
         st.markdown(msg["content"])
 
 # Input
-prompt = st.chat_input(f"Chiedi a {selected_mode}...")
+prompt = st.chat_input("Chiedi qualcosa...")
 
 if prompt:
     st.session_state.history.append({"role": "user", "content": prompt})
-    st.session_state.total_queries += 1
     
     with st.chat_message("user"):
         st.markdown(prompt)
     
     with st.chat_message("assistant"):
         container = st.empty()
+        container.info("🔄 Elaborazione con RLM...")
         
-        # ==========================================
-        # MODALITÀ RLM MINIMAL
-        # ==========================================
-        if use_rlm and RLM_AVAILABLE:
-            container.info("🧠 RLM Minimal: Avvio ragionamento ricorsivo...")
+        with st.status("🧠 RLM in esecuzione...", expanded=show_logs) as status:
+            status.write(f"Root LM: {root_model}")
+            status.write(f"Sub LM: {recursive_model}")
             
-            try:
-                # 1. Costruisci contesto
-                context = build_context_for_rlm(prompt, active_client)
-                
-                # 2. Prepara persona
-                persona = personas.PERSONA_MAP.get(selected_mode, "Sei un assistente professionale.")
-                
-                # 3. Crea istanza RLM
-                with st.status("🔄 RLM in esecuzione...", expanded=show_logs) as status:
-                    
-                    status.write("Inizializzazione RLM_REPL...")
-                    
-                    # Imposta variabili ambiente per RLM Minimal
-                    os.environ["OPENAI_API_KEY"] = QWEN_API_KEY
-                    os.environ["OPENAI_BASE_URL"] = QWEN_BASE_URL
-                    
-                    rlm = RLM_REPL(
-                        model=QWEN_MODEL_DEFAULT,      # Root model
-                        recursive_model=recursive_model,  # Sub-LLM model
-                        max_iterations=max_iterations,
-                        enable_logging=show_logs
-                    )
-                    
-                    status.write(f"Context size: {len(context)} caratteri")
-                    status.write("Esecuzione completion...")
-                    
-                    import time
-                    start_time = time.time()
-                    
-                    result = rlm.completion(
-                        context=context,
-                        query=prompt
-                    )
-                    
-                    elapsed = time.time() - start_time
-                    
-                    status.update(label=f"✅ Completato in {elapsed:.1f}s", state="complete")
-                
-                # Mostra risposta
-                answer = result
-                container.markdown(answer)
-                
-                # Metriche
-                st.divider()
-                cols = st.columns(3)
-                cols[0].metric("Tempo", f"{elapsed:.1f}s")
-                cols[1].metric("Iterazioni", f"≤{max_iterations}")
-                
-                estimated_cost = elapsed * 0.01
-                st.session_state.total_cost += estimated_cost
-                cols[2].metric("Costo ≈", f"${estimated_cost:.3f}")
-                
-                st.session_state.history.append({"role": "assistant", "content": answer})
-                
-            except Exception as e:
-                import traceback
-                container.error(f"Errore RLM: {e}")
-                st.code(traceback.format_exc())
-                st.warning("Tentativo fallback a modalità standard...")
-                use_rlm = False
+            result = run_rlm(
+                query=prompt,
+                chat_history=st.session_state.history,
+                active_client=active_client,
+                model=root_model,
+                recursive_model=recursive_model,
+                max_iterations=max_iter,
+                show_logs=show_logs
+            )
+            
+            if result["success"]:
+                status.update(label=f"✅ Completato in {result['time']:.1f}s", state="complete")
+            else:
+                status.update(label="❌ Errore", state="error")
         
-        # ==========================================
-        # MODALITÀ STANDARD (Fallback)
-        # ==========================================
-        if not use_rlm or not RLM_AVAILABLE:
-            container.info("⚡ Elaborazione standard...")
+        if result["success"]:
+            container.markdown(result["response"])
             
-            try:
-                # Ricerca memoria
-                suggested_filter = personas.FILTER_MAP.get(selected_mode, None)
-                
-                if active_client:
-                    retrieved_data = tools.search_memory(prompt, f"CLIENT_{active_client.upper()}")
-                    if "Nessun dato trovato" in retrieved_data:
-                        retrieved_data = tools.search_memory(prompt, None)
-                else:
-                    retrieved_data = tools.search_memory(prompt, suggested_filter)
-                    if "Nessun dato trovato" in retrieved_data:
-                        retrieved_data = tools.search_memory(prompt, None)
-                
-                # Genera risposta
-                persona = personas.PERSONA_MAP.get(selected_mode, "Sei un assistente utile.")
-                
-                final_prompt = f"""
-{persona}
-
-[QUERY UTENTE]
-{prompt}
-
-[DATI DALLA MEMORIA]
-{retrieved_data}
-
-[ISTRUZIONI]
-- Rispondi in modo completo e professionale
-- Cita le fonti se usi dati dalla memoria
-- Se mancano informazioni, chiedi chiarimenti
-"""
-                
-                response = client_ai.chat.completions.create(
-                    model=QWEN_MODEL_DEFAULT,
-                    messages=[{"role": "user", "content": final_prompt}],
-                    temperature=0.7
-                )
-                
-                answer = response.choices[0].message.content
-                
-                # Metriche
-                usage = response.usage
-                cost = ((usage.prompt_tokens/1000)*0.004) + ((usage.completion_tokens/1000)*0.012)
-                st.session_state.total_cost += cost
-                
-                container.markdown(answer)
-                st.caption(f"📊 Token: {usage.total_tokens} | Costo: ${cost:.5f}")
-                
-                st.session_state.history.append({"role": "assistant", "content": answer})
-                
-            except Exception as e:
-                container.error(f"Errore: {e}")
+            # Stats
+            cost = result.get("cost", 0)
+            st.session_state.total_cost += cost
+            
+            st.caption(
+                f"⏱️ {result['time']:.1f}s | "
+                f"🔄 {result.get('iterations', '?')} iter | "
+                f"💰 ${cost:.4f}"
+            )
+            
+            st.session_state.history.append({"role": "assistant", "content": result["response"]})
+        else:
+            container.error(result.get("error", "Errore sconosciuto"))
+            if show_logs and "traceback" in result:
+                st.code(result["traceback"])
 
 # Footer
 st.divider()
-st.caption(f"Agency OS v9.0 - RLM Minimal | Qdrant: {ASUS_IP} | Ingest: {ACER_IP}")
+st.caption("Agency OS v14.0 | RLM + Qwen + Qdrant | DashScope International")

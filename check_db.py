@@ -3,7 +3,7 @@ from qdrant_client import QdrantClient
 
 # --- CONFIGURAZIONE ---
 # Assicurati che questo sia l'IP corretto dello Zenbook
-IP_ZENBOOK = "192.168.1.4" 
+IP_ZENBOOK = "192.168.1.6" 
 PORT = 6333
 COLLECTION_NAME = "agenzia_memory" # Il nome standard usato dal tuo sistema
 

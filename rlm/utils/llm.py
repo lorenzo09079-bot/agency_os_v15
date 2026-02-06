@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OpenAI-compatible Client per Qwen (DashScope)
-Per RLM Minimal - Agency OS
-
-QUESTO FILE SOSTITUISCE rlm/utils/llm.py
+OpenAI-compatible Client per Qwen (DashScope) - Agency OS v14
 """
 
 import os
@@ -13,36 +10,30 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configurazione Qwen via DashScope
-DEFAULT_API_KEY = os.getenv("QWEN_API_KEY", "sk-96a9773427c649d5a6af2a6842404c88")
-DEFAULT_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+# Import config (con fallback)
+try:
+    from config import QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL_ROOT, QWEN_MODEL_SUB
+except ImportError:
+    QWEN_API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-c6cdd02fbdb14232a22a589b94a18d14")
+    QWEN_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    QWEN_MODEL_ROOT = "qwen3-coder-plus"
+    QWEN_MODEL_SUB = "qwen-plus"
 
 
 class OpenAIClient:
-    """
-    Client compatibile con RLM Minimal che usa Qwen via DashScope.
-    L'API DashScope è compatibile con il formato OpenAI.
-    """
+    """Client compatibile con RLM che usa Qwen via DashScope."""
     
     def __init__(
         self, 
         api_key: Optional[str] = None, 
-        model: str = "qwen-max",
+        model: str = None,
         base_url: Optional[str] = None
     ):
-        self.api_key = api_key or DEFAULT_API_KEY
-        self.base_url = base_url or DEFAULT_BASE_URL
-        
-        if not self.api_key:
-            raise ValueError(
-                "API key richiesta. Imposta QWEN_API_KEY come variabile ambiente "
-                "o passa api_key come parametro."
-            )
-        
-        self.model = model
+        self.api_key = api_key or QWEN_API_KEY
+        self.base_url = base_url or QWEN_BASE_URL
+        self.model = model or QWEN_MODEL_ROOT
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         
-        # Per tracking costi (opzionale)
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_calls = 0
@@ -54,26 +45,12 @@ class OpenAIClient:
         temperature: float = 0.7,
         **kwargs
     ) -> str:
-        """
-        Esegue una completion.
-        
-        Args:
-            messages: Lista di messaggi o stringa singola
-            max_tokens: Limite token output
-            temperature: Creatività (0-1)
-            **kwargs: Altri parametri passati all'API
-        
-        Returns:
-            Testo della risposta
-        """
         try:
-            # Normalizza input
             if isinstance(messages, str):
                 messages = [{"role": "user", "content": messages}]
             elif isinstance(messages, dict):
                 messages = [messages]
 
-            # Prepara parametri chiamata
             call_params = {
                 "model": self.model,
                 "messages": messages,
@@ -82,16 +59,9 @@ class OpenAIClient:
             
             if max_tokens:
                 call_params["max_completion_tokens"] = max_tokens
-            
-            # Aggiungi altri kwargs (escludendo quelli non supportati)
-            for key, value in kwargs.items():
-                if key not in ["timeout"]:  # timeout gestito separatamente
-                    call_params[key] = value
 
-            # Esegui chiamata
             response = self.client.chat.completions.create(**call_params)
             
-            # Tracking usage
             if hasattr(response, 'usage') and response.usage:
                 self.total_input_tokens += response.usage.prompt_tokens
                 self.total_output_tokens += response.usage.completion_tokens
@@ -100,40 +70,37 @@ class OpenAIClient:
             return response.choices[0].message.content
 
         except Exception as e:
-            raise RuntimeError(f"Errore generazione completion: {str(e)}")
+            raise RuntimeError(f"Errore completion: {str(e)}")
     
     def get_usage_stats(self) -> dict:
-        """Ritorna statistiche di utilizzo."""
+        prices = {
+            "qwen3-coder-plus": {"input": 1.0, "output": 5.0},
+            "qwen-plus": {"input": 0.4, "output": 1.2},
+            "qwen-flash": {"input": 0.05, "output": 0.4},
+        }
+        model_prices = prices.get(self.model, {"input": 1.0, "output": 5.0})
+        cost = (self.total_input_tokens / 1_000_000) * model_prices["input"] + \
+               (self.total_output_tokens / 1_000_000) * model_prices["output"]
+        
         return {
-            "total_calls": self.total_calls,
-            "total_input_tokens": self.total_input_tokens,
-            "total_output_tokens": self.total_output_tokens,
-            "total_tokens": self.total_input_tokens + self.total_output_tokens,
-            "estimated_cost": self._calculate_cost()
+            "calls": self.total_calls,
+            "input_tokens": self.total_input_tokens,
+            "output_tokens": self.total_output_tokens,
+            "model": self.model,
+            "cost_usd": round(cost, 4)
         }
     
-    def _calculate_cost(self) -> float:
-        """Calcola costo stimato (prezzi Qwen approssimativi)."""
-        # Qwen-max: ~$0.004/1K input, $0.012/1K output
-        input_cost = (self.total_input_tokens / 1000) * 0.004
-        output_cost = (self.total_output_tokens / 1000) * 0.012
-        return input_cost + output_cost
-    
     def reset_stats(self):
-        """Reset statistiche."""
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_calls = 0
 
 
-# Test
-if __name__ == "__main__":
-    print("Test OpenAIClient (Qwen)...")
-    
-    client = OpenAIClient(model="qwen-max")
-    
-    response = client.completion("Dimmi 'ciao' in 3 lingue.")
-    print(f"Risposta: {response}")
-    
-    stats = client.get_usage_stats()
-    print(f"Stats: {stats}")
+def create_root_client(api_key: Optional[str] = None) -> OpenAIClient:
+    """Client per Root LM (codice)."""
+    return OpenAIClient(api_key=api_key, model=QWEN_MODEL_ROOT)
+
+
+def create_sub_client(api_key: Optional[str] = None) -> OpenAIClient:
+    """Client per Sub LM (testi)."""
+    return OpenAIClient(api_key=api_key, model=QWEN_MODEL_SUB)

@@ -1,7 +1,7 @@
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
-IP_ZENBOOK = "192.168.1.4"
+IP_ZENBOOK = "192.168.1.6"
 client = QdrantClient(host=IP_ZENBOOK, port=6333)
 COLLECTION_NAME = "agenzia_memory"
 
