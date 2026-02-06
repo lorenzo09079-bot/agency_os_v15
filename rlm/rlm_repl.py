@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-RLM REPL - Agency OS v15
-Root LM: qwen-max
-Sub LM: qwen-plus
+RLM REPL - Agency OS v16
+=========================
+
+Root LM: qwen3-max (258k context — no più troncamenti aggressivi)
+Sub LM: qwen-plus (fino a 1M context — analizza documenti interi)
+
+Cambio chiave rispetto a v15:
+- max_context_tokens è ADATTIVO, basato sul modello scelto
+- Con qwen3-max (258k) il sistema ha margine sufficiente per 15+ iterazioni
+- Troncamento solo come safety net, non come meccanismo primario
 """
 
 from typing import Dict, List, Optional, Any
@@ -17,16 +24,21 @@ from rlm.logger.root_logger import ColorfulLogger
 from rlm.logger.repl_logger import REPLEnvLogger
 
 try:
-    from config import QWEN_MODEL_ROOT, QWEN_MODEL_SUB
+    from config import QWEN_MODEL_ROOT, QWEN_MODEL_SUB, get_safe_context_limit
 except ImportError:
-    QWEN_MODEL_ROOT = "qwen-max"
+    QWEN_MODEL_ROOT = "qwen3-max"
     QWEN_MODEL_SUB = "qwen-plus"
+    def get_safe_context_limit(model=None):
+        return 200000  # Fallback sicuro per qwen3-max
 
 
 class RLM_REPL(RLM):
     """
     Recursive Language Model con REPL environment.
-    Root LM orchestra, Sub LM analizza. Tools Qdrant iniettati nel REPL.
+    
+    Root LM orchestra il processo (esplora, delega, sintetizza).
+    Sub LM analizza i documenti (riceve il contenuto completo).
+    Tools Qdrant vengono iniettati nel REPL.
     """
     
     def __init__(
@@ -37,7 +49,7 @@ class RLM_REPL(RLM):
         max_iterations: int = 20,
         depth: int = 0,
         enable_logging: bool = True,
-        max_context_tokens: int = 80000,
+        max_context_tokens: int = None,  # None = adattivo dal modello
     ):
         self.api_key = api_key
         self.model = model or QWEN_MODEL_ROOT
@@ -47,7 +59,12 @@ class RLM_REPL(RLM):
         self.repl_env = None
         self.depth = depth
         self._max_iterations = max_iterations
-        self._max_context_tokens = max_context_tokens
+        
+        # Limite contesto ADATTIVO basato sul modello
+        if max_context_tokens is not None:
+            self._max_context_tokens = max_context_tokens
+        else:
+            self._max_context_tokens = get_safe_context_limit(self.model)
         
         self.logger = ColorfulLogger(enabled=enable_logging)
         self.repl_env_logger = REPLEnvLogger(enabled=enable_logging)
@@ -78,13 +95,21 @@ class RLM_REPL(RLM):
         return self.messages
 
     def _check_context_size(self) -> bool:
-        """Tronca messaggi se il contesto è troppo grande."""
+        """
+        Safety net: tronca messaggi solo se il contesto supera il limite.
+        Con qwen3-max (258k) questo dovrebbe accadere raramente.
+        """
         total_text = "".join(m.get("content", "") for m in self.messages)
         estimated_tokens = len(total_text) // 4
         
         if estimated_tokens > self._max_context_tokens:
-            self.logger.log_tool_execution("CONTEXT", f"Troncamento ({estimated_tokens} tokens)...")
-            self.messages = utils.truncate_messages_if_needed(self.messages, self._max_context_tokens)
+            self.logger.log_tool_execution(
+                "CONTEXT_OVERFLOW", 
+                f"Contesto {estimated_tokens:,} tokens > limite {self._max_context_tokens:,}. Troncamento..."
+            )
+            self.messages = utils.truncate_messages_if_needed(
+                self.messages, self._max_context_tokens
+            )
             return True
         return False
 
@@ -107,8 +132,12 @@ class RLM_REPL(RLM):
                 )
             except Exception as e:
                 error_msg = str(e)
-                if "length" in error_msg.lower() or "token" in error_msg.lower():
-                    # Contesto troppo lungo, tronca e riprova
+                # Errore di contesto troppo lungo: tronca aggressivamente e riprova
+                if any(kw in error_msg.lower() for kw in ["length", "token", "30720", "258048"]):
+                    self.logger.log_tool_execution(
+                        "CONTEXT_ERROR",
+                        f"Errore contesto: {error_msg[:200]}. Troncamento aggressivo..."
+                    )
                     self.messages = utils.truncate_messages_if_needed(
                         self.messages, self._max_context_tokens // 2
                     )
@@ -117,7 +146,7 @@ class RLM_REPL(RLM):
                             self.messages + [next_action_prompt(query, iteration)]
                         )
                     except Exception as e2:
-                        return f"Errore critico: {str(e2)}"
+                        return f"Errore critico dopo troncamento: {str(e2)}"
                 else:
                     return f"Errore: {error_msg}"
             

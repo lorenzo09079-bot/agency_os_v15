@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Agency OS v15.0 - App Unificata
+Agency OS v16.0 - App Unificata
 ================================
 
-- Root LM: qwen-max (ragionamento, orchestrazione REPL)
-- Sub LM: qwen-plus (analisi testi e dati)
-- Ingester: integrato (niente più server Acer)
+v16 — Cambio modello Root LM:
+- Root LM: qwen3-max (258k context — allineato al paper RLM)
+- Sub LM: qwen-plus (fino a 1M context — analizza documenti interi)
+- Limiti adattivi basati sul modello scelto
+- Ingester: integrato
 - Database: Qdrant su Asus Zenbook
 - Frontend: Streamlit
 
@@ -34,6 +36,7 @@ from config import (
     QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME,
     ENCODER_MODEL, DATA_FILES_DIR,
     CHUNK_SIZE, CHUNK_OVERLAP,
+    get_safe_context_limit,
 )
 
 # Import RLM
@@ -42,11 +45,11 @@ from rlm.utils.prompts import DEFAULT_QUERY, next_action_prompt, build_system_pr
 import rlm.utils.utils as utils
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Agency OS v15", layout="wide", page_icon="🧠")
+st.set_page_config(page_title="Agency OS v16", layout="wide", page_icon="🧠")
 
 
 # ============================================
-# INGESTER LOCALE (sostituisce server_ingest.py)
+# INGESTER LOCALE
 # ============================================
 
 def extract_text(file_bytes: bytes, filename: str) -> str:
@@ -55,7 +58,7 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
     
     if ext == 'pdf':
         try:
-            import fitz  # PyMuPDF
+            import fitz
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             text = "\n\n".join(page.get_text() for page in doc)
             doc.close()
@@ -95,7 +98,7 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list:
-    """Divide il testo in chunks con overlap."""
+    """Divide il testo in chunks con overlap per embedding vettoriale."""
     words = text.split()
     if len(words) <= chunk_size:
         return [text] if text.strip() else []
@@ -107,48 +110,37 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         if chunk.strip():
             chunks.append(chunk)
         i += chunk_size - overlap
-    
     return chunks
 
 
 def ingest_file(file_bytes: bytes, filename: str, tag: str, doc_type: str) -> dict:
-    """
-    Indicizza un file nel database Qdrant.
-    Ritorna dict con risultato.
-    """
+    """Indicizza un file nel database Qdrant."""
     from qdrant_client import QdrantClient
     from qdrant_client.http import models as qmodels
     from sentence_transformers import SentenceTransformer
     
-    # Connessione
     try:
         qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30)
     except Exception as e:
         return {"success": False, "error": f"Connessione Qdrant fallita: {e}"}
     
     encoder = SentenceTransformer(ENCODER_MODEL)
-    
-    # Normalizza tag
     tag = tag.strip().upper().replace(" ", "_")
     
-    # Estrai testo
     raw_text = extract_text(file_bytes, filename)
     if not raw_text or len(raw_text) < 10:
         return {"success": False, "error": "File vuoto o non leggibile"}
     
-    # Chunking
     chunks = chunk_text(raw_text)
     if not chunks:
         return {"success": False, "error": "Nessun chunk generato"}
     
-    # Encoding e upload
     timestamp = datetime.now()
     points = []
     
     for i, chunk in enumerate(chunks):
         vector = encoder.encode(chunk).tolist()
         point_id = str(uuid.uuid4())
-        
         points.append(qmodels.PointStruct(
             id=point_id,
             vector=vector,
@@ -163,25 +155,20 @@ def ingest_file(file_bytes: bytes, filename: str, tag: str, doc_type: str) -> di
             }
         ))
     
-    # Upload in batch da 100
     try:
         for batch_start in range(0, len(points), 100):
             batch = points[batch_start:batch_start + 100]
             qdrant.upsert(collection_name=COLLECTION_NAME, points=batch)
-        
         return {
-            "success": True,
-            "filename": filename,
-            "tag": tag,
-            "chunks": len(chunks),
-            "chars": len(raw_text),
+            "success": True, "filename": filename,
+            "tag": tag, "chunks": len(chunks), "chars": len(raw_text),
         }
     except Exception as e:
         return {"success": False, "error": f"Upload Qdrant fallito: {e}"}
 
 
 def save_data_file(file_bytes: bytes, filename: str):
-    """Salva file dati (Excel/CSV) localmente per analisi diretta."""
+    """Salva file dati localmente per analisi diretta."""
     data_dir = Path(DATA_FILES_DIR)
     data_dir.mkdir(exist_ok=True)
     filepath = data_dir / filename
@@ -212,10 +199,7 @@ def get_tools_for_injection() -> dict:
 # ============================================
 
 def build_full_context(chat_history: list, active_client: str = None) -> str:
-    """
-    Costruisce il contesto con lo storico completo.
-    L'AI decide cosa è rilevante.
-    """
+    """Costruisce il contesto con lo storico completo."""
     parts = []
     
     if active_client:
@@ -231,8 +215,8 @@ def build_full_context(chat_history: list, active_client: str = None) -> str:
         for i, msg in enumerate(chat_history[:-1], 1):
             role = "UTENTE" if msg["role"] == "user" else "ASSISTENTE"
             content = msg["content"]
-            if len(content) > 1500:
-                content = content[:1500] + "... [troncato]"
+            if len(content) > 3000:
+                content = content[:3000] + "... [troncato nello storico]"
             parts.append(f"[{i}. {role}]: {content}")
             parts.append("")
         
@@ -262,44 +246,48 @@ def run_rlm(
     recursive_model = recursive_model or QWEN_MODEL_SUB
     
     try:
-        # Env vars per OpenAI client
         os.environ["OPENAI_API_KEY"] = QWEN_API_KEY
         os.environ["OPENAI_BASE_URL"] = QWEN_BASE_URL
         
-        # Crea RLM
         rlm = RLM_REPL(
             model=model,
             recursive_model=recursive_model,
             max_iterations=max_iterations,
-            enable_logging=show_logs
+            enable_logging=show_logs,
         )
         
-        # Contesto
         context = build_full_context(chat_history, active_client)
-        
-        # Se c'è una persona, aggiungila al contesto
         if persona:
             context = f"=== RUOLO ===\n{persona}\n\n{context}"
         
-        # Setup
         rlm.setup_context(context=context, query=query)
         
-        # Inietta tools Qdrant nel REPL
         if rlm.repl_env:
             rlm.repl_env.inject_tools(get_tools_for_injection())
         
-        # Loop RLM
+        safe_limit = get_safe_context_limit(model)
+        
         for iteration in range(max_iterations):
             try:
                 response = rlm.llm.completion(
                     rlm.messages + [next_action_prompt(query, iteration)]
                 )
             except Exception as e:
-                if "length" in str(e).lower() or "token" in str(e).lower():
-                    rlm.messages = utils.truncate_messages_if_needed(rlm.messages, 15000)
-                    response = rlm.llm.completion(
-                        rlm.messages + [next_action_prompt(query, iteration)]
+                error_str = str(e)
+                if any(kw in error_str.lower() for kw in ["length", "token", "30720", "258048"]):
+                    rlm.messages = utils.truncate_messages_if_needed(
+                        rlm.messages, safe_limit // 2
                     )
+                    try:
+                        response = rlm.llm.completion(
+                            rlm.messages + [next_action_prompt(query, iteration)]
+                        )
+                    except Exception as e2:
+                        return {
+                            "success": False,
+                            "error": f"Errore dopo troncamento: {str(e2)}",
+                            "time": time.time() - start_time,
+                        }
                 else:
                     raise
             
@@ -319,7 +307,6 @@ def run_rlm(
             if final_answer:
                 rlm.logger.log_final_response(final_answer)
                 stats = rlm.llm.get_usage_stats()
-                
                 return {
                     "success": True,
                     "response": final_answer,
@@ -329,7 +316,7 @@ def run_rlm(
                     "cost": stats.get("cost_usd", 0)
                 }
         
-        # Max iterations: forza risposta
+        # Max iterations
         rlm.messages.append(next_action_prompt(query, max_iterations, final_answer=True))
         final_response = rlm.llm.completion(rlm.messages)
         stats = rlm.llm.get_usage_stats()
@@ -358,9 +345,8 @@ def run_rlm(
 # ============================================
 
 with st.sidebar:
-    st.title("🧠 Agency OS v15")
+    st.title("🧠 Agency OS v16")
     
-    # Cliente
     st.subheader("👤 Cliente")
     known_clients = ["Euroitalia", "Nike", "Test"]
     opts = ["— Tutti —"] + known_clients
@@ -369,16 +355,13 @@ with st.sidebar:
     
     st.divider()
     
-    # Specialista
     st.subheader("🎭 Specialista")
     available_roles = list(personas.PERSONA_MAP.keys())
     selected_mode = st.selectbox("Ruolo", available_roles)
     
     st.divider()
     
-    # Upload & Ingest (INTEGRATO)
     st.subheader("📤 Carica Documenti")
-    
     uploaded_files = st.file_uploader(
         "File",
         type=["pdf", "txt", "docx", "xlsx", "xls", "csv", "md"],
@@ -392,10 +375,8 @@ with st.sidebar:
     )
     doc_type = st.selectbox("Tipo", ["Report Dati", "Strategia", "Ricerca", "Chat", "Meeting"])
     
-    # Checkbox per salvare Excel/CSV anche localmente
     has_data_files = uploaded_files and any(
-        f.name.lower().endswith(('.xlsx', '.xls', '.csv'))
-        for f in uploaded_files
+        f.name.lower().endswith(('.xlsx', '.xls', '.csv')) for f in uploaded_files
     )
     save_local = False
     if has_data_files:
@@ -403,47 +384,46 @@ with st.sidebar:
     
     if st.button("📤 Carica", use_container_width=True) and uploaded_files and tag:
         progress = st.progress(0)
-        
         for i, f in enumerate(uploaded_files):
             try:
                 f.seek(0)
                 file_bytes = f.read()
-                
-                # Indicizza in Qdrant
                 result = ingest_file(file_bytes, f.name, tag, doc_type)
-                
                 if result["success"]:
                     st.success(f"✅ {f.name} ({result['chunks']} chunks)")
-                    
-                    # Salva localmente se richiesto
                     if save_local and f.name.lower().endswith(('.xlsx', '.xls', '.csv')):
                         save_data_file(file_bytes, f.name)
                 else:
                     st.error(f"❌ {f.name}: {result['error']}")
-            
             except Exception as e:
                 st.error(f"❌ {f.name}: {e}")
-            
             progress.progress((i + 1) / len(uploaded_files))
     
     st.divider()
     
-    # Impostazioni avanzate
     with st.expander("⚙️ Impostazioni"):
-        root_model = st.selectbox("Root LM", [
-            "qwen-max", "qwen-plus", "qwen-flash"
-        ], index=0)
+        root_models = [
+            "qwen3-max",    # 258k — RACCOMANDATO
+            "qwen-plus",    # 129k (fino a 1M)
+            "qwen-max",     # 30k — ATTENZIONE
+            "qwen-flash",   # 129k
+        ]
+        root_model = st.selectbox(
+            "Root LM", root_models, index=0,
+            help="qwen3-max (258k) è raccomandato. qwen-max (30k) ha contesto troppo piccolo."
+        )
+        if root_model == "qwen-max":
+            st.warning("⚠️ qwen-max ha solo 30k token. Rischio errori con documenti lunghi.")
         
-        sub_model = st.selectbox("Sub LM", [
-            "qwen-plus", "qwen-flash"
-        ], index=0)
-        
+        sub_model = st.selectbox("Sub LM", ["qwen-plus", "qwen-flash"], index=0)
         max_iter = st.slider("Max iterazioni", 3, 25, 15)
         show_logs = st.checkbox("Mostra log REPL", value=False)
+        
+        safe_ctx = get_safe_context_limit(root_model)
+        st.caption(f"Limite contesto sicuro: {safe_ctx:,} token")
     
     st.divider()
     
-    # Stats
     if "total_cost" not in st.session_state:
         st.session_state.total_cost = 0.0
     
@@ -462,14 +442,13 @@ with st.sidebar:
 # MAIN
 # ============================================
 
-st.title("🧠 Agency OS v15")
+st.title("🧠 Agency OS v16")
 st.caption(
     f"Focus: **{active_client or 'Tutti'}** | "
     f"Specialista: **{selected_mode}** | "
     f"Root: {root_model} | Sub: {sub_model}"
 )
 
-# History
 if "history" not in st.session_state:
     st.session_state.history = []
 
@@ -477,7 +456,6 @@ for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Input
 prompt = st.chat_input("Chiedi qualcosa...")
 
 if prompt:
@@ -507,25 +485,24 @@ if prompt:
             )
             
             if result["success"]:
-                status.update(label=f"✅ {result['time']:.1f}s | {result.get('iterations', '?')} iter", state="complete")
+                status.update(
+                    label=f"✅ {result['time']:.1f}s | {result.get('iterations', '?')} iter",
+                    state="complete"
+                )
             else:
                 status.update(label="❌ Errore", state="error")
         
         if result["success"]:
             container.markdown(result["response"])
-            
             cost = result.get("cost", 0)
             st.session_state.total_cost += cost
-            
             st.caption(
                 f"⏱️ {result['time']:.1f}s | "
                 f"🔄 {result.get('iterations', '?')} iter | "
                 f"💰 ${cost:.4f}"
             )
-            
             st.session_state.history.append({
-                "role": "assistant",
-                "content": result["response"]
+                "role": "assistant", "content": result["response"]
             })
         else:
             container.error(f"Errore: {result.get('error', 'Sconosciuto')}")
@@ -535,4 +512,4 @@ if prompt:
 # Footer
 st.divider()
 qdrant_status = "✅" if tools.qdrant else "❌"
-st.caption(f"Agency OS v15 | Qdrant {qdrant_status} | {QDRANT_HOST}:{QDRANT_PORT}")
+st.caption(f"Agency OS v16 | Qdrant {qdrant_status} | {QDRANT_HOST}:{QDRANT_PORT}")

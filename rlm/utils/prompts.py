@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Prompt templates per RLM - Agency OS v15
+Prompt templates per RLM - Agency OS v16
 ========================================
-Prompt in italiano ottimizzati per Qwen-max + database Qdrant.
+
+Ottimizzati per qwen3-max (258k context) come Root LM.
+Con 258k di contesto il Root LM ha molto più spazio,
+ma la regola fondamentale resta: il Root LM ORCHESTRA,
+il Sub-LLM ANALIZZA i documenti.
 """
 
 from typing import Dict
@@ -19,7 +23,7 @@ ESPLORAZIONE DATABASE:
 - list_all_tags() -> Dict con tutti i tag e conteggio chunks
 - find_related_tags(keyword) -> Lista tag che contengono la keyword
 - list_files_by_tag(tag) -> Lista file di un tag
-- get_file_content(filename) -> CONTENUTO COMPLETO di un file
+- get_file_content(filename) -> Contenuto completo di un file (salvato in variabile REPL)
 - get_database_stats() -> Statistiche database
 
 RICERCA:
@@ -27,24 +31,42 @@ RICERCA:
 - search_by_keyword(keyword, tag_filter=None) -> Ricerca parola esatta
 
 ANALISI CON SUB-LLM:
-- llm_query(prompt) -> Chiedi al Sub-LLM di analizzare testo lungo
+- llm_query(prompt) -> Chiedi al Sub-LLM di analizzare testo lungo (ha 1M di context!)
 
 ═══════════════════════════════════════════════════════════════
-COME USARE IL REPL
+⚠️ REGOLA FONDAMENTALE: COME GESTIRE I DOCUMENTI
 ═══════════════════════════════════════════════════════════════
 
-Scrivi codice Python in blocchi ```repl```. Esempio:
+I documenti possono essere enormi (100k+ caratteri). Segui SEMPRE questo pattern:
 
+STEP 1 — Carica il file in una variabile REPL (senza stamparlo):
 ```repl
-tags = list_all_tags()
-print(tags)
+content = get_file_content("file.docx")
+print(f"File caricato: {len(content)} caratteri")
 ```
 
-Per analizzare dati con il Sub-LLM:
+STEP 2 — Analizza con il Sub-LLM (che ha 1M di context e vede TUTTO):
 ```repl
-content = get_file_content("report.csv")
-analisi = llm_query(f"Analizza questi dati e trova i trend principali:\\n{content}")
+analisi = llm_query(f"Analizza questo documento ed estrai [cosa ti serve]:\\n{content}")
 print(analisi)
+```
+
+❌ NON fare MAI: print(content) — scarica tutto nei messaggi inutilmente!
+✅ FAI SEMPRE: carica → analizza con llm_query() → leggi il risultato
+
+PER PIÙ FILE — analizzali uno alla volta con loop:
+```repl
+risultati = []
+for file_info in files:
+    content = get_file_content(file_info['filename'])
+    analisi = llm_query(f"Estrai le informazioni chiave per [obiettivo]:\\n{content}")
+    risultati.append(f"📄 {file_info['filename']}:\\n{analisi}")
+    print(f"✅ Analizzato: {file_info['filename']}")
+```
+
+Puoi anche leggere piccole porzioni direttamente se ti serve un'anteprima:
+```repl
+print(content[:3000])  # Prime 3000 chars per capire la struttura
 ```
 
 ═══════════════════════════════════════════════════════════════
@@ -54,45 +76,35 @@ REGOLE ANTI-ALLUCINAZIONE
 ⚠️ VIETATO inventare dati. Se non trovi informazioni, dillo chiaramente.
 ⚠️ VIETATO fare supposizioni su metriche, budget, KPI senza dati reali.
 ⚠️ SEMPRE citare la fonte (filename, tag) quando riporti dati.
-⚠️ Se i dati sono in formato CSV/Excel, LEGGILI con get_file_content() prima di analizzare.
+⚠️ Se i dati sono CSV/Excel, LEGGILI con get_file_content() e analizza con llm_query().
 
-CORRETTO: "Dal file report_meta.csv, il CTR medio è 2.3%"
+CORRETTO: "Dal file report_meta.csv (tag DATI_EUROITALIA_METAADS), il CTR medio è 2.3%"
 SBAGLIATO: "Il CTR tipico per questo settore è circa 2-3%" (senza fonte)
 
 ═══════════════════════════════════════════════════════════════
 PROCESSO DI LAVORO
 ═══════════════════════════════════════════════════════════════
 
-1. Leggi il context (storico conversazione)
-2. Interpreta la richiesta ATTUALE dell'utente
-3. Esplora il database step-by-step:
-   - Un blocco ```repl``` per esplorare i tag
-   - Un blocco per listare i file  
-   - Un blocco per leggere il contenuto
-   - Un blocco per calcolare/analizzare
-4. FINAL() solo quando hai TUTTI i dati
+1. Esplora i tag con list_all_tags()
+2. Lista i file con list_files_by_tag()
+3. Per ogni file rilevante:
+   a. Carica con get_file_content() in una variabile
+   b. Analizza con llm_query() — il Sub-LLM vede il documento intero
+   c. Salva il risultato dell'analisi
+4. Sintetizza tutte le analisi
+5. FINAL() con la risposta completa
 
-⚠️ NON comprimere tutto in un blocco solo!
-⚠️ NON mettere FINAL() nello stesso blocco dei calcoli!
+⚠️ Un blocco ```repl``` per ogni step!
 
 ═══════════════════════════════════════════════════════════════
 RISPOSTA FINALE
 ═══════════════════════════════════════════════════════════════
 
-Quando hai la risposta, usa UNO di questi:
-
+Quando hai la risposta, usa:
 FINAL(la tua risposta completa qui)
 
 Oppure, se la risposta è in una variabile:
-```repl
-risposta = "testo lungo..."
-```
-FINAL_VAR(risposta)
-
-La risposta FINAL() deve contenere:
-1. I DATI REALI trovati (non solo descriverli)
-2. Statistiche calcolate (se applicabile)
-3. Analisi basata sui dati concreti
+FINAL_VAR(nome_variabile)
 
 Rispondi SEMPRE in ITALIANO.
 """
@@ -109,42 +121,48 @@ def next_action_prompt(query: str, iteration: int = 0, final_answer: bool = Fals
     if final_answer:
         return {"role": "user", "content": f"""Fornisci ORA la risposta finale per: "{query}"
 
-⚠️ La risposta FINAL() deve contenere i DATI REALI trovati.
-
+Sintetizza tutte le analisi raccolte dal Sub-LLM e dalle ricerche nel database.
 FINAL(la tua risposta completa)"""}
     
     if iteration == 0:
         return {"role": "user", "content": f"""Query dell'utente: "{query}"
 
-STEP 1 - Esplora il database:
-
+STEP 1 — Esplora il database per capire cosa è disponibile:
 ```repl
 tags = list_all_tags()
 print(f"Tag disponibili: {{tags}}")
 ```
 
-Procedi STEP BY STEP con blocchi ```repl``` SEPARATI.
-NON dare una risposta finale senza prima aver cercato nel database."""}
+Ricorda: per i documenti, carica in variabile e analizza con llm_query()."""}
     
-    elif iteration < 3:
-        return {"role": "user", "content": f"""Continua l'analisi per: "{query}"
+    elif iteration == 1:
+        return {"role": "user", "content": f"""Continua per: "{query}"
 
-Prossimo step (scegli UNO per blocco):
-1. list_files_by_tag() - se non hai ancora i file
-2. get_file_content() - se non hai letto il contenuto
-3. Calcoli Python - se hai dati numerici
-4. llm_query(dati) - per analisi semantica sui DATI REALI
-5. FINAL() - SOLO quando hai raccolto TUTTO"""}
+STEP 2 — Lista i file nei tag rilevanti con list_files_by_tag().
+Poi scegli quali file analizzare per rispondere alla query."""}
     
-    elif iteration >= 10:
+    elif iteration < 6:
+        return {"role": "user", "content": f"""Continua per: "{query}"
+
+STEP {iteration + 1} — Hai file da analizzare? Segui il pattern:
+```repl
+content = get_file_content("nome_file")
+analisi = llm_query(f"[richiesta specifica basata sulla query]:\\n{{content}}")
+print(analisi)
+```
+
+Se hai già tutte le analisi necessarie → FINAL() con la risposta completa."""}
+    
+    elif iteration >= 14:
         return {"role": "user", "content": f"""Hai fatto {iteration} iterazioni. Concludi ORA.
 
-Se hai trovato dati, usa FINAL() con i risultati.
-Se non hai trovato nulla: FINAL("Non ho trovato dati rilevanti per: {query}")"""}
+Sintetizza tutto ciò che hai raccolto e fornisci la risposta.
+Se non hai trovato dati: FINAL("Non ho trovato dati rilevanti per: {query}")
+Altrimenti: FINAL(la tua risposta basata sulle analisi)"""}
     
     else:
         return {"role": "user", "content": f"""Continua per: "{query}" (iterazione {iteration}).
 
-Hai ancora dati da raccogliere o analizzare?
-- Sì → altro blocco ```repl```
-- No → FINAL() con la risposta completa"""}
+Hai ancora file da analizzare o dati da raccogliere?
+- Sì → carica con get_file_content() e analizza con llm_query()
+- No → FINAL() con la risposta completa basata su tutte le analisi"""}
