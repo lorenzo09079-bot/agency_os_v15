@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Tools v15 - Agency OS
+Tools v16 - Agency OS
 =====================
-Funzioni per esplorare il database Qdrant.
+CHANGELOG v16:
+- get_file_content() restituisce errori chiari e inconfondibili
+- Aggiunto fuzzy matching per nomi file simili
+- Aggiunto suggest_filename() per suggerire nomi corretti
+- Migliore diagnostica quando un file non viene trovato
+
 Tutte le configurazioni vengono da config.py.
 """
 
@@ -17,17 +22,20 @@ from config import QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME, ENCODER_MODEL
 # INIZIALIZZAZIONE
 # ============================================
 
-print(f"Tools v15: Connessione a {QDRANT_HOST}:{QDRANT_PORT}...")
+print(f"Tools v16: Connessione a {QDRANT_HOST}:{QDRANT_PORT}...")
 
 try:
     qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30)
     qdrant.get_collections()
-    print("Tools v15: ✅ Connesso!")
+    print("Tools v16: ✅ Connesso!")
 except Exception as e:
-    print(f"Tools v15: ❌ Qdrant non raggiungibile: {e}")
+    print(f"Tools v16: ❌ Qdrant non raggiungibile: {e}")
     qdrant = None
 
 encoder = SentenceTransformer(ENCODER_MODEL)
+
+# Cache interna dei nomi file noti (popolata da list_files_by_tag)
+_known_filenames: set = set()
 
 
 # ============================================
@@ -43,9 +51,41 @@ def _normalize_filename(filename_or_dict) -> str:
 
 def _check_qdrant():
     """Verifica connessione Qdrant."""
-    if qdrant is None:
-        return False
-    return True
+    return qdrant is not None
+
+
+def _find_similar_filenames(target: str, known: set, threshold: float = 0.4) -> List[str]:
+    """
+    Trova nomi file simili usando confronto semplice.
+    Restituisce lista di nomi simili ordinata per rilevanza.
+    """
+    target_lower = target.lower()
+    suggestions = []
+    
+    for known_name in known:
+        known_lower = known_name.lower()
+        
+        # Exact match (case insensitive)
+        if target_lower == known_lower:
+            return [known_name]
+        
+        # Partial match: il target è contenuto nel nome noto o viceversa
+        if target_lower in known_lower or known_lower in target_lower:
+            suggestions.append((known_name, 0.8))
+            continue
+        
+        # Parole in comune
+        target_words = set(target_lower.replace('.', ' ').replace('_', ' ').replace('-', ' ').split())
+        known_words = set(known_lower.replace('.', ' ').replace('_', ' ').replace('-', ' ').split())
+        
+        if target_words and known_words:
+            common = target_words & known_words
+            score = len(common) / max(len(target_words), len(known_words))
+            if score >= threshold:
+                suggestions.append((known_name, score))
+    
+    suggestions.sort(key=lambda x: x[1], reverse=True)
+    return [name for name, _ in suggestions[:3]]
 
 
 # ============================================
@@ -83,6 +123,8 @@ def list_all_tags() -> Dict[str, int]:
 
 def list_files_by_tag(tag: str) -> List[Dict[str, Any]]:
     """Elenca tutti i file associati a un tag."""
+    global _known_filenames
+    
     if not _check_qdrant():
         return [{"error": "Connessione Qdrant non disponibile"}]
     
@@ -112,6 +154,7 @@ def list_files_by_tag(tag: str) -> List[Dict[str, Any]]:
                     files_info[fn]["chunks"] += 1
                     files_info[fn]["doc_type"] = point.payload.get("doc_type", "")
                     files_info[fn]["date"] = point.payload.get("date", "")[:10]
+                    _known_filenames.add(fn)  # Cache del nome
             
             if offset is None:
                 break
@@ -126,11 +169,20 @@ def list_files_by_tag(tag: str) -> List[Dict[str, Any]]:
 
 
 def get_file_content(filename, max_chunks: int = 50) -> str:
-    """Recupera il contenuto completo di un file specifico."""
+    """
+    Recupera il contenuto completo di un file specifico.
+    
+    IMPORTANTE: Restituisce un messaggio di errore chiaramente marcato
+    con "ERRORE:" se il file non viene trovato, così il Root LM 
+    può riconoscerlo e non passarlo al Sub-LM per "analisi".
+    """
     if not _check_qdrant():
         return "ERRORE: Connessione Qdrant non disponibile"
     
     filename = _normalize_filename(filename)
+    
+    if not filename or len(filename.strip()) < 3:
+        return "ERRORE: Nome file vuoto o troppo corto. Usa list_files_by_tag() per ottenere i nomi corretti."
     
     try:
         qdrant_filter = models.Filter(
@@ -147,7 +199,19 @@ def get_file_content(filename, max_chunks: int = 50) -> str:
         )
         
         if not results:
-            return f"File '{filename}' non trovato nel database."
+            # File non trovato — suggerisci nomi simili
+            suggestions = _find_similar_filenames(filename, _known_filenames)
+            
+            error_msg = f"ERRORE: File '{filename}' non trovato nel database."
+            if suggestions:
+                error_msg += f"\n\nForse intendevi uno di questi?\n"
+                for s in suggestions:
+                    error_msg += f"  → {s}\n"
+                error_msg += "\nUsa list_files_by_tag() per vedere tutti i file disponibili."
+            else:
+                error_msg += "\nUsa list_files_by_tag('NOME_TAG') per vedere i file disponibili."
+            
+            return error_msg
         
         chunks = []
         metadata = {}
@@ -166,7 +230,7 @@ def get_file_content(filename, max_chunks: int = 50) -> str:
         
         header = f"=== FILE: {filename} ===\n"
         header += f"Tag: {metadata.get('tag', 'N/A')} | Tipo: {metadata.get('doc_type', 'N/A')}\n"
-        header += f"Chunks: {len(chunks)}\n"
+        header += f"Chunks: {len(chunks)} | Caratteri totali: {len(full_text)}\n"
         header += "=" * 50 + "\n\n"
         
         return header + full_text

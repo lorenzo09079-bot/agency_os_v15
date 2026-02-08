@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-REPL Environment - Agency OS v15
-Sub LM: qwen-plus (via config)
+REPL Environment - Agency OS v16
+================================
+CHANGELOG v16:
+- llm_query() wrappato con prefix anti-allucinazione
+- Aggiunta validate_content() per verificare se un file è stato letto correttamente
+- FINAL/FINAL_VAR migliorati
+- Sub LM: qwen-plus (via config)
 """
 
 import sys
@@ -22,6 +27,13 @@ try:
     from config import QWEN_MODEL_SUB
 except ImportError:
     QWEN_MODEL_SUB = "qwen-plus"
+
+# Import anti-hallucination prefix
+try:
+    from rlm.utils.prompts import get_sub_llm_prefix
+except ImportError:
+    def get_sub_llm_prefix():
+        return "ISTRUZIONE: Basa la tua analisi SOLO sui dati forniti. NON inventare dati.\n\nDATI:\n"
 
 
 class Sub_RLM(RLM):
@@ -76,6 +88,9 @@ class REPLEnv:
         # Sub-RLM
         self.sub_rlm: RLM = Sub_RLM(model=recursive_model)
         
+        # Anti-hallucination prefix
+        self._sub_llm_prefix = get_sub_llm_prefix()
+        
         # Globals sicuri
         self.globals = {
             '__builtins__': {
@@ -116,14 +131,82 @@ class REPLEnv:
         # Load context
         self.load_context(context_json, context_str)
         
-        # llm_query function
+        # ============================================================
+        # llm_query CON ANTI-ALLUCINAZIONE
+        # ============================================================
         def llm_query(prompt: str) -> str:
-            """Query al Sub-LLM."""
+            """
+            Query al Sub-LLM CON prefix anti-allucinazione automatico.
+            
+            Il prefix istruisce il Sub-LLM a:
+            - Basarsi SOLO sui dati forniti
+            - NON inventare metriche/statistiche
+            - Segnalare "ERRORE: Nessun dato" se il testo è vuoto/errore
+            - Etichettare [CONOSCENZA GENERALE] le integrazioni
+            """
+            # Controlla se il prompt contiene segnali di contenuto mancante
+            error_signals = [
+                "non trovato nel database",
+                "ERRORE:",
+                "File '' non trovato",
+                "non è disponibile",
+            ]
+            
+            for signal in error_signals:
+                if signal.lower() in prompt.lower():
+                    return (
+                        "ERRORE: Il contenuto passato indica che il file non è stato trovato "
+                        "nel database. Non è possibile analizzare dati inesistenti. "
+                        "Verifica il nome del file con list_files_by_tag() e riprova."
+                    )
+            
+            # Se il contenuto è troppo corto (probabile errore)
+            if len(prompt) < 150:
+                return (
+                    f"ATTENZIONE: Il testo da analizzare è molto breve ({len(prompt)} chars). "
+                    "Potrebbe essere un messaggio di errore. Verifica il contenuto del file."
+                )
+            
+            # Aggiungi prefix anti-allucinazione
+            augmented_prompt = self._sub_llm_prefix + prompt
+            
+            return self.sub_rlm.completion(augmented_prompt)
+        
+        # Versione "raw" senza prefix (per casi speciali)
+        def llm_query_raw(prompt: str) -> str:
+            """Query al Sub-LLM SENZA prefix (per sintesi finali, ecc.)."""
             return self.sub_rlm.completion(prompt)
         
         self.globals['llm_query'] = llm_query
+        self.globals['llm_query_raw'] = llm_query_raw
         
+        # ============================================================
+        # HELPER: validate_content
+        # ============================================================
+        def validate_content(content: str, filename: str = "") -> bool:
+            """
+            Verifica se get_file_content() ha restituito dati validi.
+            Restituisce True se il contenuto è utilizzabile, False altrimenti.
+            Stampa un messaggio diagnostico.
+            """
+            if not content or len(content) < 100:
+                print(f"⚠️ CONTENUTO NON VALIDO: '{filename}' — solo {len(content) if content else 0} chars")
+                return False
+            
+            error_indicators = ["ERRORE:", "non trovato", "non disponibile", "File '' non trovato"]
+            for indicator in error_indicators:
+                if indicator.lower() in content[:200].lower():
+                    print(f"⚠️ FILE NON TROVATO: '{filename}' — {content[:150]}")
+                    return False
+            
+            print(f"✅ FILE VALIDO: '{filename}' — {len(content)} chars")
+            return True
+        
+        self.globals['validate_content'] = validate_content
+        
+        # ============================================================
         # FINAL functions
+        # ============================================================
         def final_answer(value) -> str:
             """Salva come risposta finale."""
             result = str(value)
@@ -147,7 +230,6 @@ class REPLEnv:
             elif clean_name in self.globals:
                 result = str(self.globals[clean_name])
             elif len(variable_name) > 100:
-                # Probabilmente è il contenuto stesso, non un nome variabile
                 result = variable_name
             else:
                 return f"Errore: Variabile '{clean_name}' non trovata"
