@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Prompt templates per RLM - Agency OS v16
-========================================
-CHANGELOG v16:
-- Anti-allucinazione: Root LM DEVE usare SOLO file reali dal database
-- Protocollo obbligatorio: esplora → salva nomi → valida → analizza
-- Sub-LM istruito a rifiutare analisi senza dati
-- Distinzione esplicita [DATI_DATABASE] vs [CONOSCENZA_GENERALE]
+Prompt templates per RLM - Agency OS v16 (Multi-Persona)
+=========================================================
+ARCHITETTURA:
+- Root LM: system prompt LEAN che conosce TUTTI gli specialisti
+- Root LM decide chi chiamare (uno o più) in base alla query
+- Sub-LM riceve mega-prompt completo via repl.py (NON qui)
 """
 
 from typing import Dict
@@ -14,154 +13,119 @@ from typing import Dict
 DEFAULT_QUERY = "Leggi il contesto e rispondi alle query o esegui le istruzioni contenute."
 
 # ============================================================
-# SYSTEM PROMPT - ANTI-ALLUCINAZIONE
+# SYSTEM PROMPT ROOT LM — MULTI-PERSONA
 # ============================================================
 
-REPL_SYSTEM_PROMPT = """Sei un ASSISTENTE INTELLIGENTE con accesso a un database aziendale via ambiente REPL Python.
+REPL_SYSTEM_PROMPT = """Sei un ORCHESTRATORE INTELLIGENTE con accesso a un database aziendale e a un TEAM di specialisti via REPL Python.
+
+Il tuo ruolo NON è rispondere direttamente alle domande dell'utente.
+Il tuo ruolo è: CERCARE i dati nel database → DELEGARE l'analisi allo SPECIALISTA giusto → ASSEMBLARE la risposta finale.
 
 ═══════════════════════════════════════════════════════════════
-STRUMENTI DISPONIBILI NEL REPL
+🧰 STRUMENTI DATABASE (nel REPL)
 ═══════════════════════════════════════════════════════════════
 
-ESPLORAZIONE DATABASE:
+ESPLORAZIONE:
 - list_all_tags() -> Dict con tutti i tag e conteggio chunks
 - find_related_tags(keyword) -> Lista tag che contengono la keyword
-- list_files_by_tag(tag) -> Lista file di un tag (restituisce dict con 'filename', 'chunks', 'doc_type', 'date')
-- get_file_content(filename) -> Contenuto completo di un file (salvato in variabile REPL)
+- list_files_by_tag(tag) -> Lista file di un tag (dict con 'filename', 'chunks', ecc.)
+- get_file_content(filename) -> Contenuto completo di un file
 - get_database_stats() -> Statistiche database
 
 RICERCA:
 - search_semantic(query, tag_filter=None, top_k=10) -> Ricerca per significato
 - search_by_keyword(keyword, tag_filter=None) -> Ricerca parola esatta
 
-ANALISI CON SUB-LLM:
-- llm_query(prompt) -> Chiedi al Sub-LLM di analizzare testo lungo (ha 1M di context!)
+VALIDAZIONE:
+- validate_content(content, filename) -> True se il file è stato letto correttamente
 
 ═══════════════════════════════════════════════════════════════
-⚠️ REGOLA #1 — ANTI-ALLUCINAZIONE (OBBLIGATORIA)
+🎭 TEAM DI SPECIALISTI (nel REPL)
 ═══════════════════════════════════════════════════════════════
 
-🚫 NON INVENTARE MAI nomi di file. Usa ESCLUSIVAMENTE i nomi restituiti da list_files_by_tag().
-🚫 NON INVENTARE MAI metriche, KPI, percentuali o statistiche. Se non le trovi nei file, non citarle.
-🚫 NON CITARE fonti inesistenti. Cita SOLO file che hai effettivamente letto con successo.
+{specialists_section}
 
-Se get_file_content() restituisce un errore o contenuto < 100 caratteri, il file è VUOTO o NON TROVATO.
-In quel caso: SALTA quel file e passa al prossimo. NON chiedere al Sub-LLM di "analizzare" un errore.
+GENERICO:
+- llm_query(dati) → Sub-LLM generico (anti-allucinazione, no persona specifica)
+- llm_query_raw(dati) → Sub-LLM senza prefix (per sintesi finali su dati già validati)
 
-═══════════════════════════════════════════════════════════════
-⚠️ REGOLA #2 — PROTOCOLLO OBBLIGATORIO (segui in ordine!)
-═══════════════════════════════════════════════════════════════
+COME SCEGLIERE LO SPECIALISTA:
+- Query su campagne, budget, Meta Ads, Google Ads, performance → ask_ads_strategist()
+- Query su copy, landing page, headline, persuasione, VoC → ask_copywriter()
+- Query su articoli blog, content marketing, SEO editoriale → ask_blog_editor()
+- Query su social media, calendari, engagement, hashtag → ask_smm()
+- Query su analisi dati, metriche, trend, KPI → ask_data_scientist()
+- Query generiche o di esplorazione database → llm_query()
 
-STEP 1 — ESPLORA: Scopri cosa c'è nel database.
-```repl
-tags = list_all_tags()
-print(tags)
-```
-
-STEP 2 — LISTA FILE: Per ogni tag rilevante, ottieni i nomi ESATTI.
-```repl
-files = list_files_by_tag("NOME_TAG")
-nomi_file = [f['filename'] for f in files if 'filename' in f]
-print(f"File disponibili: {nomi_file}")
-```
-
-STEP 3 — LEGGI FILE REALI: Usa SOLO i nomi dalla lista `nomi_file`.
-```repl
-for nome in nomi_file:
-    content = get_file_content(nome)
-    if "ERRORE" in content or "non trovato" in content.lower() or len(content) < 100:
-        print(f"⚠️ SKIP: {nome} (vuoto o errore)")
-    else:
-        print(f"✅ {nome}: {len(content)} caratteri caricati")
-        # Analizza con Sub-LLM
-        analisi = llm_query(f"Analizza questo documento ed estrai le informazioni chiave:\\n{content}")
-        print(analisi)
-```
-
-STEP 4 — RISPONDI: Usa FINAL() con dati REALI trovati.
-- Etichetta ogni dato: [FONTE: nome_file.ext] per dati dal database
-- Etichetta: [CONOSCENZA GENERALE] per informazioni non dal database
-- Se non hai trovato dati rilevanti, dillo chiaramente
+⚡ COLLABORAZIONE: Se la query richiede più competenze, CHIAMA PIÙ SPECIALISTI.
+Esempio: "Crea strategia ads con copy per landing page"
+→ Prima ask_ads_strategist() per la strategia
+→ Poi ask_copywriter() per il copy
+→ Assembla entrambi nella risposta finale
 
 ═══════════════════════════════════════════════════════════════
-⚠️ REGOLA #3 — COME GESTIRE I DOCUMENTI
+⚠️ REGOLE ANTI-ALLUCINAZIONE (OBBLIGATORIE)
 ═══════════════════════════════════════════════════════════════
 
-I documenti possono essere enormi (100k+ caratteri). Segui SEMPRE questo pattern:
+🚫 NON INVENTARE MAI nomi di file. Usa SOLO quelli restituiti da list_files_by_tag().
+🚫 NON PASSARE errori al Sub-LLM. Se get_file_content() restituisce "ERRORE:" → SALTA.
+🚫 NON INVENTARE metriche. Se non le trovi nei file, non citarle.
 
-CARICA in variabile (senza stampare tutto):
+═══════════════════════════════════════════════════════════════
+📋 PROTOCOLLO OBBLIGATORIO
+═══════════════════════════════════════════════════════════════
+
+STEP 1 — ESPLORA: list_all_tags()
+STEP 2 — LISTA FILE: list_files_by_tag("TAG") → salva nomi in variabile
+STEP 3 — LEGGI E VALIDA: get_file_content(nome) + validate_content()
+STEP 4 — DELEGA: passa i dati allo specialista giusto (o a più specialisti)
+STEP 5 — ASSEMBLA: combina le analisi e rispondi con FINAL()
+
+PATTERN COLLABORAZIONE (più specialisti):
 ```repl
-content = get_file_content("nome_esatto_dal_database.docx")
-print(f"File caricato: {len(content)} caratteri")
-```
-
-ANALIZZA con Sub-LLM (che ha 1M di context e vede TUTTO):
-```repl
-analisi = llm_query(f"Analizza questo documento ed estrai [cosa ti serve]:\\n{content}")
-print(analisi)
-```
-
-❌ NON fare MAI: print(content) — scarica tutto nei messaggi inutilmente!
-✅ FAI SEMPRE: carica → verifica lunghezza → analizza con llm_query() → leggi il risultato
-
-PER PIÙ FILE — analizzali uno alla volta con loop:
-```repl
-risultati = []
-for nome in nomi_file:
-    content = get_file_content(nome)
-    if "ERRORE" in content or len(content) < 100:
-        print(f"⚠️ SKIP: {nome}")
-        continue
-    analisi = llm_query(f"Estrai le informazioni chiave per [obiettivo]:\\n{content}")
-    risultati.append(f"📄 {nome}:\\n{analisi}")
-    print(f"✅ Analizzato: {nome}")
+content = get_file_content("report_meta.csv")
+if validate_content(content, "report_meta.csv"):
+    # Analisi strategica
+    strategia = ask_ads_strategist(f"Analizza performance e proponi strategia:\\n{{content}}")
+    print("=== STRATEGIA ===")
+    print(strategia)
+    
+    # Copy per le ads
+    copy = ask_copywriter(f"Scrivi copy per le ads basandoti su questa strategia:\\n{{strategia}}")
+    print("=== COPY ===")
+    print(copy)
 ```
 
 ═══════════════════════════════════════════════════════════════
 RISPOSTA FINALE
 ═══════════════════════════════════════════════════════════════
 
-Quando hai la risposta, usa:
-
-FINAL(la tua risposta completa qui)
-
-Oppure, se la risposta è in una variabile:
-```repl
-risposta = "testo lungo..."
-```
-FINAL_VAR(risposta)
-
-La risposta FINAL() DEVE:
-1. Contenere i DATI REALI trovati nel database, con fonte [FONTE: filename]
-2. Separare chiaramente [CONOSCENZA GENERALE] se integri con info non dal DB
-3. NON contenere metriche inventate (CTR, CPC, ROAS ecc.) senza fonte
+FINAL(risposta) — La risposta DEVE:
+1. Contenere DATI REALI con fonte [FONTE: filename]
+2. Indicare QUALE SPECIALISTA ha prodotto ogni sezione
+3. Separare [CONOSCENZA GENERALE] se integri info non dal DB
+4. NON contenere metriche inventate
 
 Rispondi SEMPRE in ITALIANO.
 """
 
 
-# ============================================================
-# SUB-LLM ANTI-HALLUCINATION PREFIX
-# ============================================================
-
-SUB_LLM_PREFIX = """ISTRUZIONE CRITICA: Basa la tua analisi ESCLUSIVAMENTE sui dati forniti nel testo qui sotto.
-- Se il testo contiene "non trovato", "errore", o è vuoto → rispondi SOLO "ERRORE: Nessun dato disponibile per l'analisi."
-- NON inventare dati, metriche, statistiche o informazioni non presenti nel testo.
-- Se i dati sono insufficienti, dì chiaramente cosa manca.
-- Quando integri con conoscenza generale, etichetta esplicitamente: [CONOSCENZA GENERALE: ...]
-
-DATI DA ANALIZZARE:
-"""
-
-
-def build_system_prompt() -> list[Dict[str, str]]:
-    """Costruisce il system prompt iniziale."""
-    return [{"role": "system", "content": REPL_SYSTEM_PROMPT}]
-
-
-def get_sub_llm_prefix() -> str:
-    """Restituisce il prefix anti-allucinazione per il Sub-LLM."""
-    return SUB_LLM_PREFIX
+def build_system_prompt(specialists_list: str = "") -> list[Dict[str, str]]:
+    """
+    Costruisce il system prompt per il Root LM.
+    
+    Args:
+        specialists_list: Stringa con tutti gli specialisti disponibili
+                          (generata automaticamente da REPLEnv.available_specialists)
+    """
+    if specialists_list:
+        specialists_section = f"Specialisti disponibili nel REPL:\n{specialists_list}"
+    else:
+        specialists_section = "Nessuno specialista registrato. Usa llm_query() per l'analisi."
+    
+    prompt = REPL_SYSTEM_PROMPT.format(specialists_section=specialists_section)
+    
+    return [{"role": "system", "content": prompt}]
 
 
 # ============================================================
@@ -175,78 +139,71 @@ def next_action_prompt(query: str, iteration: int = 0, final_answer: bool = Fals
         return {"role": "user", "content": f"""Fornisci ORA la risposta finale per: "{query}"
 
 ⚠️ REGOLE per FINAL():
-- Includi SOLO dati che hai effettivamente trovato e letto dal database
-- Etichetta ogni dato con [FONTE: nome_file]
-- Se integri con conoscenza generale, etichetta [CONOSCENZA GENERALE]
-- NON inventare metriche (CTR, CPC, ROAS ecc.) senza averle lette da un file
+- Solo dati effettivamente trovati [FONTE: nome_file]
+- Indica quale specialista ha prodotto ogni analisi
+- MAI metriche inventate
 
 FINAL(la tua risposta completa)"""}
     
     if iteration == 0:
         return {"role": "user", "content": f"""Query dell'utente: "{query}"
 
-STEP 1 — ESPLORA il database (OBBLIGATORIO prima di qualsiasi altra cosa):
-
+STEP 1 — ESPLORA il database:
 ```repl
 tags = list_all_tags()
 print(f"Tag disponibili: {{tags}}")
 ```
 
 ⚠️ NON dare risposte senza prima esplorare il database.
-⚠️ NON inventare nomi di file. Usa SOLO quelli che troverai con list_files_by_tag()."""}
+⚠️ NON inventare nomi di file.
+⚠️ DECIDI quale specialista (o quali) servono per questa query."""}
     
     elif iteration == 1:
         return {"role": "user", "content": f"""Continua per: "{query}"
 
-STEP 2 — LISTA i file ESATTI per i tag rilevanti:
-
+STEP 2 — LISTA file per i tag rilevanti:
 ```repl
-# Usa i tag che hai scoperto allo step precedente
 files = list_files_by_tag("NOME_TAG")
 nomi_file = [f['filename'] for f in files if 'filename' in f]
 print(f"File disponibili: {{nomi_file}}")
 ```
 
-⚠️ SALVA i nomi in una variabile. Li userai per get_file_content() allo step successivo."""}
+⚠️ SALVA i nomi in variabile. Li userai per get_file_content()."""}
     
     elif iteration == 2:
         return {"role": "user", "content": f"""Continua per: "{query}"
 
-STEP 3 — LEGGI i file usando SOLO i nomi dalla lista `nomi_file` (o equivalente):
-
+STEP 3 — LEGGI, VALIDA e DELEGA allo specialista:
 ```repl
-# Leggi OGNI file e analizzalo. SOLO nomi dalla lista!
+risultati = []
 for nome in nomi_file:
     content = get_file_content(nome)
-    if "ERRORE" in content or "non trovato" in content.lower() or len(content) < 100:
-        print(f"⚠️ SKIP: {{nome}} - vuoto o errore")
-        continue
-    print(f"✅ {{nome}}: {{len(content)}} chars")
-    analisi = llm_query(f"Estrai le informazioni chiave rilevanti per: {query}\\n\\n{{content}}")
-    print(f"--- Analisi {{nome}} ---")
-    print(analisi[:3000])
+    if validate_content(content, nome):
+        # SCEGLI lo specialista giusto!
+        analisi = ask_ads_strategist(f"Analizza per: {query}\\n\\n{{content}}")
+        risultati.append(f"📄 {{nome}}:\\n{{analisi}}")
+        print(f"✅ {{nome}}")
+    else:
+        print(f"⚠️ SKIP: {{nome}}")
 ```
 
-⚠️ Se un file dà errore, SALTA. Non inventare il contenuto."""}
+⚠️ Scegli la funzione ask_* corretta in base alla query!"""}
     
     elif iteration < 5:
-        return {"role": "user", "content": f"""Continua l'analisi per: "{query}" (iterazione {iteration}).
+        return {"role": "user", "content": f"""Continua per: "{query}" (iterazione {iteration}).
 
-Se hai ancora file da leggere → altro blocco ```repl``` con nomi dalla lista.
-Se hai letto tutti i file → produci FINAL() con:
-- Dati reali trovati [FONTE: nome_file]
-- Eventuale integrazione [CONOSCENZA GENERALE]
-- MAI metriche inventate"""}
+Hai ancora file da leggere → altro blocco ```repl```
+Hai letto tutto → FINAL() con dati reali + fonti + nome specialista"""}
     
     elif iteration >= 10:
         return {"role": "user", "content": f"""Hai fatto {iteration} iterazioni. Concludi ORA con FINAL().
 
-Se hai trovato dati → usa FINAL() con i risultati reali.
-Se non hai trovato nulla → FINAL("Non ho trovato dati rilevanti nel database per: {query}. [CONOSCENZA GENERALE: ...integrazione...]")"""}
+Se hai dati → FINAL() con risultati reali.
+Se non hai trovato nulla → FINAL("Non ho trovato dati rilevanti per: {query}")"""}
     
     else:
         return {"role": "user", "content": f"""Continua per: "{query}" (iterazione {iteration}).
 
-Hai ancora dati da raccogliere o analizzare?
-- Sì → altro blocco ```repl``` (usa SOLO nomi file già scoperti)
-- No → FINAL() con dati reali + fonti"""}
+Ancora dati da raccogliere? → ```repl```
+Servono più specialisti? → Chiama un altro ask_*()
+Pronto? → FINAL() con dati reali + fonti"""}

@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-REPL Environment - Agency OS v16
-================================
-CHANGELOG v16:
-- llm_query() wrappato con prefix anti-allucinazione
-- Aggiunta validate_content() per verificare se un file è stato letto correttamente
-- FINAL/FINAL_VAR migliorati
-- Sub LM: qwen-plus (via config)
+REPL Environment - Agency OS v16 (Multi-Persona)
+=================================================
+ARCHITETTURA MULTI-PERSONA:
+- Ogni specialista ha la sua funzione nel REPL: ask_ads_strategist(), ask_copywriter(), etc.
+- Ogni chiamata inietta: ANTI-ALLUCINAZIONE + MEGA-PROMPT specifico + DATI
+- Root LM decide AUTONOMAMENTE chi chiamare in base alla query
+- llm_query() resta come generico (senza persona specifica)
+- validate_content() per verificare file prima dell'analisi
 """
 
 import sys
@@ -18,22 +19,33 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict
 
 from rlm import RLM
 
-# Import config
 try:
     from config import QWEN_MODEL_SUB
 except ImportError:
     QWEN_MODEL_SUB = "qwen-plus"
 
-# Import anti-hallucination prefix
-try:
-    from rlm.utils.prompts import get_sub_llm_prefix
-except ImportError:
-    def get_sub_llm_prefix():
-        return "ISTRUZIONE: Basa la tua analisi SOLO sui dati forniti. NON inventare dati.\n\nDATI:\n"
+
+_ANTI_HALLUCINATION_PREFIX = """ISTRUZIONE CRITICA: Basa la tua analisi ESCLUSIVAMENTE sui dati forniti nel testo qui sotto.
+- Se il testo contiene "non trovato", "ERRORE:", o è vuoto → rispondi SOLO: "ERRORE: Nessun dato disponibile per l'analisi."
+- NON inventare dati, metriche, statistiche o informazioni non presenti nel testo.
+- Se i dati sono insufficienti, dì chiaramente cosa manca.
+- Quando integri con conoscenza generale, etichetta esplicitamente: [CONOSCENZA GENERALE: ...]
+
+"""
+
+# Mapping persona_key → nome funzione nel REPL
+_FUNCTION_NAMES = {
+    "Ads Strategist": "ask_ads_strategist",
+    "Creative Copywriter": "ask_copywriter",
+    "Blog Editor": "ask_blog_editor",
+    "Social Media Manager": "ask_smm",
+    "Data Scientist": "ask_data_scientist",
+    "General Analyst": "ask_analyst",
+}
 
 
 class Sub_RLM(RLM):
@@ -71,14 +83,45 @@ class REPLResult:
         self.execution_time = execution_time
 
 
+def _check_error_signals(prompt: str) -> Optional[str]:
+    """Controlla se il prompt contiene segnali di errore."""
+    error_signals = ["non trovato nel database", "ERRORE:", "File '' non trovato"]
+    for signal in error_signals:
+        if signal.lower() in prompt.lower()[:500]:
+            return (
+                "ERRORE: Il contenuto indica che il file non è stato trovato. "
+                "Non è possibile analizzare dati inesistenti. "
+                "Verifica il nome del file con list_files_by_tag()."
+            )
+    if len(prompt) < 150:
+        return (
+            f"ATTENZIONE: Testo troppo breve ({len(prompt)} chars). "
+            "Potrebbe essere un errore. Verifica il contenuto del file."
+        )
+    return None
+
+
 class REPLEnv:
-    """Ambiente REPL per esecuzione codice Python con accesso a Sub-LLM e tools."""
+    """
+    Ambiente REPL Multi-Persona con Sub-LLM + Anti-Allucinazione.
+    
+    Il Root LM ha accesso a funzioni specialista nel REPL:
+    - ask_ads_strategist(dati)  → analisi con prompt Ads Strategist completo
+    - ask_copywriter(dati)      → analisi con prompt Creative Copywriter completo
+    - ask_blog_editor(dati)     → analisi con prompt Blog Editor completo
+    - ask_smm(dati)             → analisi con prompt Social Media Manager
+    - ask_data_scientist(dati)  → analisi con prompt Data Scientist
+    - llm_query(dati)           → Sub-LM generico (anti-allucinazione, no persona)
+    - llm_query_raw(dati)       → Sub-LM senza prefix (sintesi finali)
+    - validate_content(content, filename) → verifica validità file
+    """
     
     def __init__(
         self,
         recursive_model: str = None,
         context_json: Optional[dict | list] = None,
         context_str: Optional[str] = None,
+        personas_prompts: Dict[str, str] = None,
         setup_code: str = None,
     ):
         self.original_cwd = os.getcwd()
@@ -88,8 +131,21 @@ class REPLEnv:
         # Sub-RLM
         self.sub_rlm: RLM = Sub_RLM(model=recursive_model)
         
-        # Anti-hallucination prefix
-        self._sub_llm_prefix = get_sub_llm_prefix()
+        # Personas: dict di {persona_key: mega_prompt_completo}
+        self._personas_prompts = personas_prompts or {}
+        
+        # Pre-build prefix per ogni persona
+        self._persona_prefixes: Dict[str, str] = {}
+        for key, prompt in self._personas_prompts.items():
+            self._persona_prefixes[key] = (
+                _ANTI_HALLUCINATION_PREFIX +
+                "=== IL TUO RUOLO E KNOWLEDGE BASE ===\n\n" +
+                prompt +
+                "\n\n=== DATI DA ANALIZZARE ===\n\n"
+            )
+        
+        # Prefix generico
+        self._generic_prefix = _ANTI_HALLUCINATION_PREFIX + "DATI DA ANALIZZARE:\n\n"
         
         # Globals sicuri
         self.globals = {
@@ -112,7 +168,6 @@ class REPLEnv:
                 'memoryview': memoryview, 'complex': complex, 'frozenset': frozenset,
                 'pow': pow, 'divmod': divmod,
                 'True': True, 'False': False, 'None': None,
-                # Exceptions
                 'Exception': Exception, 'ValueError': ValueError, 'TypeError': TypeError,
                 'KeyError': KeyError, 'IndexError': IndexError, 'AttributeError': AttributeError,
                 'FileNotFoundError': FileNotFoundError, 'OSError': OSError, 'IOError': IOError,
@@ -120,7 +175,6 @@ class REPLEnv:
                 'StopIteration': StopIteration, 'ZeroDivisionError': ZeroDivisionError,
                 'OverflowError': OverflowError, 'UnicodeError': UnicodeError,
                 'UnicodeDecodeError': UnicodeDecodeError, 'UnicodeEncodeError': UnicodeEncodeError,
-                # Blocked
                 'input': None, 'eval': None, 'exec': None, 'compile': None,
                 'globals': None, 'locals': None,
             }
@@ -132,99 +186,76 @@ class REPLEnv:
         self.load_context(context_json, context_str)
         
         # ============================================================
-        # llm_query CON ANTI-ALLUCINAZIONE
+        # REGISTRA FUNZIONI SPECIALISTA
         # ============================================================
-        def llm_query(prompt: str) -> str:
-            """
-            Query al Sub-LLM CON prefix anti-allucinazione automatico.
-            
-            Il prefix istruisce il Sub-LLM a:
-            - Basarsi SOLO sui dati forniti
-            - NON inventare metriche/statistiche
-            - Segnalare "ERRORE: Nessun dato" se il testo è vuoto/errore
-            - Etichettare [CONOSCENZA GENERALE] le integrazioni
-            """
-            # Controlla se il prompt contiene segnali di contenuto mancante
-            error_signals = [
-                "non trovato nel database",
-                "ERRORE:",
-                "File '' non trovato",
-                "non è disponibile",
-            ]
-            
-            for signal in error_signals:
-                if signal.lower() in prompt.lower():
-                    return (
-                        "ERRORE: Il contenuto passato indica che il file non è stato trovato "
-                        "nel database. Non è possibile analizzare dati inesistenti. "
-                        "Verifica il nome del file con list_files_by_tag() e riprova."
-                    )
-            
-            # Se il contenuto è troppo corto (probabile errore)
-            if len(prompt) < 150:
-                return (
-                    f"ATTENZIONE: Il testo da analizzare è molto breve ({len(prompt)} chars). "
-                    "Potrebbe essere un messaggio di errore. Verifica il contenuto del file."
-                )
-            
-            # Aggiungi prefix anti-allucinazione
-            augmented_prompt = self._sub_llm_prefix + prompt
-            
-            return self.sub_rlm.completion(augmented_prompt)
         
-        # Versione "raw" senza prefix (per casi speciali)
+        available_specialists = []
+        
+        for persona_key, prefix in self._persona_prefixes.items():
+            func_name = _FUNCTION_NAMES.get(
+                persona_key,
+                f"ask_{persona_key.lower().replace(' ', '_')}"
+            )
+            
+            # Closure factory per catturare prefix correttamente
+            def _make_fn(p_key, p_prefix, f_name):
+                def persona_query(prompt: str) -> str:
+                    error = _check_error_signals(prompt)
+                    if error:
+                        return error
+                    return self.sub_rlm.completion(p_prefix + prompt)
+                persona_query.__name__ = f_name
+                persona_query.__doc__ = f"Query al Sub-LLM come {p_key}."
+                return persona_query
+            
+            fn = _make_fn(persona_key, prefix, func_name)
+            self.globals[func_name] = fn
+            available_specialists.append(f"- {func_name}(dati) → {persona_key}")
+        
+        self._available_specialists_str = "\n".join(available_specialists)
+        
+        # llm_query generico
+        def llm_query(prompt: str) -> str:
+            """Query al Sub-LLM generico (anti-allucinazione, no persona specifica)."""
+            error = _check_error_signals(prompt)
+            if error:
+                return error
+            return self.sub_rlm.completion(self._generic_prefix + prompt)
+        
         def llm_query_raw(prompt: str) -> str:
-            """Query al Sub-LLM SENZA prefix (per sintesi finali, ecc.)."""
+            """Query al Sub-LLM SENZA prefix. Per sintesi su dati già validati."""
             return self.sub_rlm.completion(prompt)
         
-        self.globals['llm_query'] = llm_query
-        self.globals['llm_query_raw'] = llm_query_raw
-        
-        # ============================================================
-        # HELPER: validate_content
-        # ============================================================
         def validate_content(content: str, filename: str = "") -> bool:
-            """
-            Verifica se get_file_content() ha restituito dati validi.
-            Restituisce True se il contenuto è utilizzabile, False altrimenti.
-            Stampa un messaggio diagnostico.
-            """
+            """Verifica se get_file_content() ha restituito dati validi."""
             if not content or len(content) < 100:
                 print(f"⚠️ CONTENUTO NON VALIDO: '{filename}' — solo {len(content) if content else 0} chars")
                 return False
-            
-            error_indicators = ["ERRORE:", "non trovato", "non disponibile", "File '' non trovato"]
-            for indicator in error_indicators:
+            for indicator in ["ERRORE:", "non trovato", "non disponibile"]:
                 if indicator.lower() in content[:200].lower():
                     print(f"⚠️ FILE NON TROVATO: '{filename}' — {content[:150]}")
                     return False
-            
             print(f"✅ FILE VALIDO: '{filename}' — {len(content)} chars")
             return True
         
+        self.globals['llm_query'] = llm_query
+        self.globals['llm_query_raw'] = llm_query_raw
         self.globals['validate_content'] = validate_content
         
-        # ============================================================
         # FINAL functions
-        # ============================================================
         def final_answer(value) -> str:
-            """Salva come risposta finale."""
             result = str(value)
             self._final_result = result
-            preview = result[:500] + "..." if len(result) > 500 else result
-            print(f"[FINAL_RESULT]: {preview}")
+            print(f"[FINAL_RESULT]: {result[:500]}{'...' if len(result)>500 else ''}")
             return result
         
         def final_var(variable_name) -> str:
-            """Restituisce una variabile come risposta finale."""
             if not isinstance(variable_name, str):
                 result = str(variable_name)
                 self._final_result = result
                 print(f"[FINAL_RESULT]: {result[:500]}")
                 return result
-            
             clean_name = variable_name.strip().strip('"').strip("'").strip()
-            
             if clean_name in self.locals:
                 result = str(self.locals[clean_name])
             elif clean_name in self.globals:
@@ -233,10 +264,8 @@ class REPLEnv:
                 result = variable_name
             else:
                 return f"Errore: Variabile '{clean_name}' non trovata"
-            
             self._final_result = result
-            preview = result[:500] + "..." if len(result) > 500 else result
-            print(f"[FINAL_RESULT]: {preview}")
+            print(f"[FINAL_RESULT]: {result[:500]}{'...' if len(result)>500 else ''}")
             return result
         
         self.globals['FINAL'] = final_answer
@@ -245,6 +274,10 @@ class REPLEnv:
         if setup_code:
             self.code_execution(setup_code)
     
+    @property
+    def available_specialists(self) -> str:
+        return self._available_specialists_str
+    
     def get_final_result(self) -> Optional[str]:
         return self._final_result
     
@@ -252,7 +285,6 @@ class REPLEnv:
         self._final_result = None
     
     def load_context(self, context_json=None, context_str=None):
-        """Carica il context nel REPL come variabile `context`."""
         if context_json is not None:
             context_path = os.path.join(self.temp_dir, "context.json")
             with open(context_path, "w", encoding="utf-8") as f:
@@ -262,7 +294,6 @@ class REPLEnv:
                 f"with open(r'{context_path}', 'r', encoding='utf-8') as f:\n"
                 f"    context = json.load(f)"
             )
-        
         if context_str is not None:
             context_path = os.path.join(self.temp_dir, "context.txt")
             with open(context_path, "w", encoding="utf-8") as f:
@@ -273,30 +304,22 @@ class REPLEnv:
             )
     
     def inject_tools(self, tools_dict: dict):
-        """Inietta funzioni esterne nel REPL (es. tools Qdrant)."""
         for name, func in tools_dict.items():
             self.globals[name] = func
     
     @contextmanager
     def _capture_output(self):
-        """Cattura stdout/stderr in modo thread-safe."""
         with self._lock:
-            old_stdout = sys.stdout
-            old_stderr = sys.stderr
-            stdout_buffer = io.StringIO()
-            stderr_buffer = io.StringIO()
-            
+            old_stdout, old_stderr = sys.stdout, sys.stderr
+            stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
             try:
-                sys.stdout = stdout_buffer
-                sys.stderr = stderr_buffer
-                yield stdout_buffer, stderr_buffer
+                sys.stdout, sys.stderr = stdout_buf, stderr_buf
+                yield stdout_buf, stderr_buf
             finally:
-                sys.stdout = old_stdout
-                sys.stderr = old_stderr
+                sys.stdout, sys.stderr = old_stdout, old_stderr
     
     @contextmanager
     def _temp_working_directory(self):
-        """Cambia temporaneamente la working directory."""
         old_cwd = os.getcwd()
         try:
             os.chdir(self.temp_dir)
@@ -305,40 +328,26 @@ class REPLEnv:
             os.chdir(old_cwd)
     
     def code_execution(self, code) -> REPLResult:
-        """Esecuzione codice notebook-style nel REPL."""
         start_time = time.time()
-        
-        with self._capture_output() as (stdout_buffer, stderr_buffer):
+        with self._capture_output() as (stdout_buf, stderr_buf):
             with self._temp_working_directory():
                 try:
-                    # Separa import dal resto
                     lines = code.split('\n')
-                    import_lines = []
-                    other_lines = []
-                    
-                    for line in lines:
-                        if line.startswith(('import ', 'from ')) and not line.startswith('#'):
-                            import_lines.append(line)
-                        else:
-                            other_lines.append(line)
-                    
+                    import_lines = [l for l in lines if l.startswith(('import ', 'from ')) and not l.startswith('#')]
+                    other_lines = [l for l in lines if not (l.startswith(('import ', 'from ')) and not l.startswith('#'))]
                     if import_lines:
                         exec('\n'.join(import_lines), self.globals, self.globals)
-                    
                     remaining = '\n'.join(other_lines)
                     if remaining.strip():
                         exec(remaining, self.globals, self.locals)
-                    
                 except Exception as e:
-                    stderr_buffer.write(f"Errore: {str(e)}\n")
-        
-        execution_time = time.time() - start_time
+                    stderr_buf.write(f"Errore: {str(e)}\n")
         
         return REPLResult(
-            stdout=stdout_buffer.getvalue(),
-            stderr=stderr_buffer.getvalue(),
+            stdout=stdout_buf.getvalue(),
+            stderr=stderr_buf.getvalue(),
             locals=dict(self.locals),
-            execution_time=execution_time
+            execution_time=time.time() - start_time
         )
     
     def __del__(self):

@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Agency OS v16.0 - App Unificata
-================================
-
-v16 — Cambio modello Root LM:
-- Root LM: qwen3-max (258k context — allineato al paper RLM)
-- Sub LM: qwen-plus (fino a 1M context — analizza documenti interi)
-- Limiti adattivi basati sul modello scelto
-- Ingester: integrato
-- Database: Qdrant su Asus Zenbook
-- Frontend: Streamlit
+Agency OS v16.0 - Multi-Persona Collaboration
+===============================================
+ARCHITETTURA:
+- TUTTI gli specialisti sono sempre disponibili
+- Root LM decide autonomamente chi chiamare (uno o più)
+- Sub LM riceve mega-prompt fresco ad ogni chiamata
+- Anti-allucinazione a 3 livelli (prompt, REPL, tools)
 
 Lancia con: streamlit run app.py
 """
@@ -36,7 +33,6 @@ from config import (
     QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME,
     ENCODER_MODEL, DATA_FILES_DIR,
     CHUNK_SIZE, CHUNK_OVERLAP,
-    get_safe_context_limit,
 )
 
 # Import RLM
@@ -53,9 +49,7 @@ st.set_page_config(page_title="Agency OS v16", layout="wide", page_icon="🧠")
 # ============================================
 
 def extract_text(file_bytes: bytes, filename: str) -> str:
-    """Estrae testo da un file in base all'estensione."""
     ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
-    
     if ext == 'pdf':
         try:
             import fitz
@@ -64,8 +58,7 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
             doc.close()
             return text
         except ImportError:
-            return "[ERRORE: PyMuPDF non installato. pip install pymupdf]"
-    
+            return "[ERRORE: PyMuPDF non installato]"
     elif ext == 'docx':
         try:
             import docx
@@ -73,38 +66,29 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
             doc = docx.Document(io.BytesIO(file_bytes))
             return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
         except ImportError:
-            return "[ERRORE: python-docx non installato. pip install python-docx]"
-    
+            return "[ERRORE: python-docx non installato]"
     elif ext in ('xlsx', 'xls', 'csv'):
         try:
             import pandas as pd
             import io
-            if ext == 'csv':
-                df = pd.read_csv(io.BytesIO(file_bytes))
-            else:
-                df = pd.read_excel(io.BytesIO(file_bytes))
+            df = pd.read_csv(io.BytesIO(file_bytes)) if ext == 'csv' else pd.read_excel(io.BytesIO(file_bytes))
             return df.to_string(index=False)
         except ImportError:
-            return "[ERRORE: pandas non installato. pip install pandas openpyxl]"
-    
+            return "[ERRORE: pandas non installato]"
     elif ext in ('txt', 'md'):
         try:
             return file_bytes.decode('utf-8')
         except UnicodeDecodeError:
             return file_bytes.decode('latin-1')
-    
     else:
         return f"[Formato .{ext} non supportato]"
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list:
-    """Divide il testo in chunks con overlap per embedding vettoriale."""
     words = text.split()
     if len(words) <= chunk_size:
         return [text] if text.strip() else []
-    
-    chunks = []
-    i = 0
+    chunks, i = [], 0
     while i < len(words):
         chunk = " ".join(words[i:i + chunk_size])
         if chunk.strip():
@@ -114,66 +98,43 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
 
 def ingest_file(file_bytes: bytes, filename: str, tag: str, doc_type: str) -> dict:
-    """Indicizza un file nel database Qdrant."""
     from qdrant_client import QdrantClient
     from qdrant_client.http import models as qmodels
     from sentence_transformers import SentenceTransformer
-    
     try:
-        qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30)
+        qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30)
     except Exception as e:
         return {"success": False, "error": f"Connessione Qdrant fallita: {e}"}
-    
-    encoder = SentenceTransformer(ENCODER_MODEL)
+    enc = SentenceTransformer(ENCODER_MODEL)
     tag = tag.strip().upper().replace(" ", "_")
-    
     raw_text = extract_text(file_bytes, filename)
     if not raw_text or len(raw_text) < 10:
         return {"success": False, "error": "File vuoto o non leggibile"}
-    
     chunks = chunk_text(raw_text)
     if not chunks:
         return {"success": False, "error": "Nessun chunk generato"}
-    
     timestamp = datetime.now()
     points = []
-    
     for i, chunk in enumerate(chunks):
-        vector = encoder.encode(chunk).tolist()
-        point_id = str(uuid.uuid4())
+        vector = enc.encode(chunk).tolist()
         points.append(qmodels.PointStruct(
-            id=point_id,
-            vector=vector,
-            payload={
-                "text": chunk,
-                "filename": filename,
-                "client_name": tag,
-                "doc_type": doc_type,
-                "chunk_index": i,
-                "total_chunks": len(chunks),
-                "date": timestamp.isoformat(),
-            }
+            id=str(uuid.uuid4()), vector=vector,
+            payload={"text": chunk, "filename": filename, "client_name": tag,
+                     "doc_type": doc_type, "chunk_index": i,
+                     "total_chunks": len(chunks), "date": timestamp.isoformat()}
         ))
-    
     try:
         for batch_start in range(0, len(points), 100):
-            batch = points[batch_start:batch_start + 100]
-            qdrant.upsert(collection_name=COLLECTION_NAME, points=batch)
-        return {
-            "success": True, "filename": filename,
-            "tag": tag, "chunks": len(chunks), "chars": len(raw_text),
-        }
+            qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points[batch_start:batch_start+100])
+        return {"success": True, "filename": filename, "tag": tag, "chunks": len(chunks), "chars": len(raw_text)}
     except Exception as e:
         return {"success": False, "error": f"Upload Qdrant fallito: {e}"}
 
 
 def save_data_file(file_bytes: bytes, filename: str):
-    """Salva file dati localmente per analisi diretta."""
     data_dir = Path(DATA_FILES_DIR)
     data_dir.mkdir(exist_ok=True)
-    filepath = data_dir / filename
-    filepath.write_bytes(file_bytes)
-    return str(filepath)
+    (data_dir / filename).write_bytes(file_bytes)
 
 
 # ============================================
@@ -181,7 +142,6 @@ def save_data_file(file_bytes: bytes, filename: str):
 # ============================================
 
 def get_tools_for_injection() -> dict:
-    """Funzioni Qdrant da iniettare nel REPL."""
     return {
         'list_all_tags': tools.list_all_tags,
         'find_related_tags': tools.find_related_tags,
@@ -195,99 +155,102 @@ def get_tools_for_injection() -> dict:
 
 
 # ============================================
-# CONTEXT BUILDER
+# ALL PERSONAS (caricati una volta)
+# ============================================
+
+def get_all_personas_prompts() -> dict:
+    """Restituisce dict {persona_key: sub_lm_prompt} per TUTTI gli specialisti."""
+    return {
+        key: personas.get_sub_lm_prompt(key)
+        for key in personas.list_personas()
+    }
+
+
+# ============================================
+# CONTEXT BUILDER (LEAN)
 # ============================================
 
 def build_full_context(chat_history: list, active_client: str = None) -> str:
-    """Costruisce il contesto con lo storico completo."""
+    """Costruisce il contesto con lo storico. Nessuna persona qui."""
     parts = []
-    
     if active_client:
         parts.append(f"=== FOCUS CLIENTE: {active_client.upper()} ===")
         parts.append(f"Tag probabili: DATI_{active_client.upper()}_*, CLIENT_{active_client.upper()}")
         parts.append("")
-    
     if chat_history and len(chat_history) > 1:
         parts.append("=== STORICO CONVERSAZIONE ===")
         parts.append("(Rispondi alla richiesta ATTUALE, usa lo storico come contesto)")
         parts.append("")
-        
         for i, msg in enumerate(chat_history[:-1], 1):
             role = "UTENTE" if msg["role"] == "user" else "ASSISTENTE"
             content = msg["content"]
-            if len(content) > 3000:
-                content = content[:3000] + "... [troncato nello storico]"
+            if len(content) > 1500:
+                content = content[:1500] + "... [troncato]"
             parts.append(f"[{i}. {role}]: {content}")
             parts.append("")
-        
         parts.append("=== FINE STORICO ===\n")
-    
     return "\n".join(parts) if parts else "Prima conversazione."
 
 
 # ============================================
-# RLM EXECUTION
+# RLM EXECUTION (MULTI-PERSONA)
 # ============================================
 
 def run_rlm(
     query: str,
     chat_history: list,
     active_client: str = None,
-    persona: str = "",
     model: str = None,
     recursive_model: str = None,
     max_iterations: int = 15,
     show_logs: bool = False
 ) -> dict:
-    """Esegue una query RLM completa."""
+    """
+    Esegue una query RLM con TUTTI gli specialisti disponibili.
+    Il Root LM decide autonomamente chi chiamare.
+    """
     start_time = time.time()
-    
     model = model or QWEN_MODEL_ROOT
     recursive_model = recursive_model or QWEN_MODEL_SUB
+    
+    # Carica TUTTI i mega-prompt
+    all_personas = get_all_personas_prompts()
     
     try:
         os.environ["OPENAI_API_KEY"] = QWEN_API_KEY
         os.environ["OPENAI_BASE_URL"] = QWEN_BASE_URL
         
+        # Crea RLM con TUTTI gli specialisti
         rlm = RLM_REPL(
             model=model,
             recursive_model=recursive_model,
             max_iterations=max_iterations,
             enable_logging=show_logs,
+            personas_prompts=all_personas,
         )
         
+        # Contesto LEAN
         context = build_full_context(chat_history, active_client)
-        if persona:
-            context = f"=== RUOLO ===\n{persona}\n\n{context}"
         
+        # Setup (crea REPL con tutti gli ask_*)
         rlm.setup_context(context=context, query=query)
         
+        # Inietta tools Qdrant
         if rlm.repl_env:
             rlm.repl_env.inject_tools(get_tools_for_injection())
         
-        safe_limit = get_safe_context_limit(model)
-        
+        # Loop RLM
         for iteration in range(max_iterations):
             try:
                 response = rlm.llm.completion(
                     rlm.messages + [next_action_prompt(query, iteration)]
                 )
             except Exception as e:
-                error_str = str(e)
-                if any(kw in error_str.lower() for kw in ["length", "token", "30720", "258048"]):
-                    rlm.messages = utils.truncate_messages_if_needed(
-                        rlm.messages, safe_limit // 2
+                if "length" in str(e).lower() or "token" in str(e).lower():
+                    rlm.messages = utils.truncate_messages_if_needed(rlm.messages, 15000)
+                    response = rlm.llm.completion(
+                        rlm.messages + [next_action_prompt(query, iteration)]
                     )
-                    try:
-                        response = rlm.llm.completion(
-                            rlm.messages + [next_action_prompt(query, iteration)]
-                        )
-                    except Exception as e2:
-                        return {
-                            "success": False,
-                            "error": f"Errore dopo troncamento: {str(e2)}",
-                            "time": time.time() - start_time,
-                        }
                 else:
                     raise
             
@@ -316,7 +279,7 @@ def run_rlm(
                     "cost": stats.get("cost_usd", 0)
                 }
         
-        # Max iterations
+        # Max iterations: forza risposta
         rlm.messages.append(next_action_prompt(query, max_iterations, final_answer=True))
         final_response = rlm.llm.completion(rlm.messages)
         stats = rlm.llm.get_usage_stats()
@@ -347,6 +310,7 @@ def run_rlm(
 with st.sidebar:
     st.title("🧠 Agency OS v16")
     
+    # Cliente
     st.subheader("👤 Cliente")
     known_clients = ["Euroitalia", "Nike", "Test"]
     opts = ["— Tutti —"] + known_clients
@@ -355,32 +319,38 @@ with st.sidebar:
     
     st.divider()
     
-    st.subheader("🎭 Specialista")
-    available_roles = list(personas.PERSONA_MAP.keys())
-    selected_mode = st.selectbox("Ruolo", available_roles)
+    # Team specialisti (informativo, non selezione)
+    st.subheader("🎭 Team Specialisti")
+    st.caption("Il Root LM sceglie automaticamente chi consultare.")
+    
+    specialist_names = {
+        "Ads Strategist": "📊 Ads Strategist",
+        "Creative Copywriter": "✍️ Copywriter",
+        "Blog Editor": "📝 Blog Editor",
+        "Social Media Manager": "📱 SMM",
+        "Data Scientist": "🔬 Data Scientist",
+        "General Analyst": "🧠 General",
+    }
+    
+    cols = st.columns(2)
+    for i, (key, label) in enumerate(specialist_names.items()):
+        cols[i % 2].markdown(f"<small>{label}</small>", unsafe_allow_html=True)
+    
+    st.caption("💡 Puoi chiedere uno specifico specialista nella query, es: *\"Come copywriter, scrivi...\"*")
     
     st.divider()
     
+    # Upload & Ingest
     st.subheader("📤 Carica Documenti")
     uploaded_files = st.file_uploader(
-        "File",
-        type=["pdf", "txt", "docx", "xlsx", "xls", "csv", "md"],
-        accept_multiple_files=True,
-        label_visibility="collapsed"
+        "File", type=["pdf", "txt", "docx", "xlsx", "xls", "csv", "md"],
+        accept_multiple_files=True, label_visibility="collapsed"
     )
-    
-    tag = st.text_input(
-        "Tag",
-        value=f"DATI_{active_client.upper()}" if active_client else "GENERALE"
-    )
+    tag = st.text_input("Tag", value=f"DATI_{active_client.upper()}" if active_client else "GENERALE")
     doc_type = st.selectbox("Tipo", ["Report Dati", "Strategia", "Ricerca", "Chat", "Meeting"])
     
-    has_data_files = uploaded_files and any(
-        f.name.lower().endswith(('.xlsx', '.xls', '.csv')) for f in uploaded_files
-    )
-    save_local = False
-    if has_data_files:
-        save_local = st.checkbox("Salva anche per analisi locale", value=True)
+    has_data_files = uploaded_files and any(f.name.lower().endswith(('.xlsx', '.xls', '.csv')) for f in uploaded_files)
+    save_local = st.checkbox("Salva anche per analisi locale", value=True) if has_data_files else False
     
     if st.button("📤 Carica", use_container_width=True) and uploaded_files and tag:
         progress = st.progress(0)
@@ -401,32 +371,18 @@ with st.sidebar:
     
     st.divider()
     
+    # Impostazioni avanzate
     with st.expander("⚙️ Impostazioni"):
-        root_models = [
-            "qwen3-max",    # 258k — RACCOMANDATO
-            "qwen-plus",    # 129k (fino a 1M)
-            "qwen-max",     # 30k — ATTENZIONE
-            "qwen-flash",   # 129k
-        ]
-        root_model = st.selectbox(
-            "Root LM", root_models, index=0,
-            help="qwen3-max (258k) è raccomandato. qwen-max (30k) ha contesto troppo piccolo."
-        )
-        if root_model == "qwen-max":
-            st.warning("⚠️ qwen-max ha solo 30k token. Rischio errori con documenti lunghi.")
-        
+        root_model = st.selectbox("Root LM", ["qwen-max", "qwen-plus", "qwen-flash"], index=0)
         sub_model = st.selectbox("Sub LM", ["qwen-plus", "qwen-flash"], index=0)
         max_iter = st.slider("Max iterazioni", 3, 25, 15)
         show_logs = st.checkbox("Mostra log REPL", value=False)
-        
-        safe_ctx = get_safe_context_limit(root_model)
-        st.caption(f"Limite contesto sicuro: {safe_ctx:,} token")
     
     st.divider()
     
+    # Stats
     if "total_cost" not in st.session_state:
         st.session_state.total_cost = 0.0
-    
     col1, col2 = st.columns(2)
     n_queries = len([m for m in st.session_state.get("history", []) if m["role"] == "user"])
     col1.metric("Queries", n_queries)
@@ -445,7 +401,7 @@ with st.sidebar:
 st.title("🧠 Agency OS v16")
 st.caption(
     f"Focus: **{active_client or 'Tutti'}** | "
-    f"Specialista: **{selected_mode}** | "
+    f"Team: **6 specialisti** | "
     f"Root: {root_model} | Sub: {sub_model}"
 )
 
@@ -460,24 +416,20 @@ prompt = st.chat_input("Chiedi qualcosa...")
 
 if prompt:
     st.session_state.history.append({"role": "user", "content": prompt})
-    
     with st.chat_message("user"):
         st.markdown(prompt)
     
     with st.chat_message("assistant"):
         container = st.empty()
-        container.info("🔄 Elaborazione con RLM...")
-        
-        persona = personas.PERSONA_MAP.get(selected_mode, "")
+        container.info("🔄 Elaborazione con RLM Multi-Persona...")
         
         with st.status("🧠 RLM in esecuzione...", expanded=show_logs) as status:
-            status.write(f"Root: {root_model} | Sub: {sub_model}")
+            status.write(f"Root: {root_model} | Sub: {sub_model} | Team: 6 specialisti")
             
             result = run_rlm(
                 query=prompt,
                 chat_history=st.session_state.history,
                 active_client=active_client,
-                persona=persona,
                 model=root_model,
                 recursive_model=sub_model,
                 max_iterations=max_iter,
@@ -485,10 +437,7 @@ if prompt:
             )
             
             if result["success"]:
-                status.update(
-                    label=f"✅ {result['time']:.1f}s | {result.get('iterations', '?')} iter",
-                    state="complete"
-                )
+                status.update(label=f"✅ {result['time']:.1f}s | {result.get('iterations', '?')} iter", state="complete")
             else:
                 status.update(label="❌ Errore", state="error")
         
@@ -496,14 +445,8 @@ if prompt:
             container.markdown(result["response"])
             cost = result.get("cost", 0)
             st.session_state.total_cost += cost
-            st.caption(
-                f"⏱️ {result['time']:.1f}s | "
-                f"🔄 {result.get('iterations', '?')} iter | "
-                f"💰 ${cost:.4f}"
-            )
-            st.session_state.history.append({
-                "role": "assistant", "content": result["response"]
-            })
+            st.caption(f"⏱️ {result['time']:.1f}s | 🔄 {result.get('iterations', '?')} iter | 💰 ${cost:.4f}")
+            st.session_state.history.append({"role": "assistant", "content": result["response"]})
         else:
             container.error(f"Errore: {result.get('error', 'Sconosciuto')}")
             if show_logs and "traceback" in result:
@@ -512,4 +455,4 @@ if prompt:
 # Footer
 st.divider()
 qdrant_status = "✅" if tools.qdrant else "❌"
-st.caption(f"Agency OS v16 | Qdrant {qdrant_status} | {QDRANT_HOST}:{QDRANT_PORT}")
+st.caption(f"Agency OS v16 Multi-Persona | Qdrant {qdrant_status} | {QDRANT_HOST}:{QDRANT_PORT}")
